@@ -76,4 +76,19 @@ describe("mergeUsage", () => {
     expect(entry.paths[`/p${MAX_PATHS_PER_DOMAIN + 49}`]).toBe(MAX_PATHS_PER_DOMAIN + 50);
     expect(entry.paths["/"]).toBeGreaterThan(0);
   });
+
+  it("keeps hourly buckets when the root path itself is folded", () => {
+    const now = Date.now();
+    const today = dateKey(new Date(now));
+    const day: DayUsage = { "example.com": { ms: 1, paths: { "/": 1 }, pathHours: { "/": { 10: 1 } } } };
+    for (let i = 0; i < MAX_PATHS_PER_DOMAIN; i++) {
+      day["example.com"].ms += i + 2;
+      day["example.com"].paths[`/p${i}`] = i + 2;
+      day["example.com"].pathHours![`/p${i}`] = { 10: i + 2 };
+    }
+    const next = mergeUsage({}, delta(today, day), now);
+    const entry = next[today]["example.com"];
+    expect(Object.keys(entry.paths)).toHaveLength(MAX_PATHS_PER_DOMAIN);
+    expect(entry.pathHours?.["/"]?.[10]).toBe(entry.paths["/"]);
+  });
 });

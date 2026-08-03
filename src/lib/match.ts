@@ -1,21 +1,18 @@
 import type { SiteLocation } from "./url";
-import { domainMatches } from "./url";
 
+// Mirrors Android KeywordMatcher exactly:
 //   youtube.com            whole site
 //   youtube.com/shorts     one section
 //   /shorts                a path on any site
-//   *.youtube.com          subdomain wildcard
-//   youtube                a word in the domain
-//   r:shorts|reels         raw regex against the url
+//   *.youtube.com          root plus one subdomain level
+//   youtube                a complete word in the domain
+//   r:shorts|reels         raw regex against domain, path, query and fragment
 export function matchKeyword(loc: SiteLocation, rawPattern: string): boolean {
   const pattern = rawPattern.trim();
   if (!pattern) return false;
+  const full = normalize(`${loc.domain}${loc.path}`);
 
-  const domain = loc.domain.toLowerCase();
-  const path = loc.path.toLowerCase() || "/";
-  const full = `${domain}${path}`;
-
-  if (pattern.startsWith("r:")) {
+  if (pattern.toLowerCase().startsWith("r:")) {
     try {
       return new RegExp(pattern.slice(2), "i").test(full);
     } catch {
@@ -23,39 +20,64 @@ export function matchKeyword(loc: SiteLocation, rawPattern: string): boolean {
     }
   }
 
-  const p = pattern
-    .toLowerCase()
-    .replace(/^https?:\/\//, "")
-    .replace(/^www\./, "");
+  const keyword = normalize(pattern);
+  if (keyword.includes("*") || keyword.includes("?")) return wildcardToRegex(keyword).test(full);
 
-  if (p.includes("*") || p.includes("?")) {
-    const re = wildcardToRegex(p);
-    return re.test(domain) || re.test(full);
+  if (keyword.startsWith("/")) {
+    const pathStart = full.indexOf("/");
+    if (pathStart < 0) return false;
+    const path = full.slice(pathStart);
+    return (
+      path === keyword ||
+      path.startsWith(`${keyword}/`) ||
+      path.startsWith(`${keyword}?`) ||
+      path.startsWith(`${keyword}#`)
+    );
   }
 
-  if (p.startsWith("/")) {
-    return path.startsWith(p);
+  if (
+    full === keyword ||
+    full.startsWith(`${keyword}/`) ||
+    full.startsWith(`${keyword}?`) ||
+    full.startsWith(`${keyword}#`)
+  ) {
+    return true;
   }
 
-  if (p.includes("/")) {
-    const slash = p.indexOf("/");
-    const d = p.slice(0, slash);
-    const sub = p.slice(slash);
-    return domainMatches(domain, d) && path.startsWith(sub);
+  if (!keyword.includes(".") && !keyword.includes("/")) {
+    const domain = full.split(/[/?#]/, 1)[0];
+    return domain.split(".").includes(keyword);
   }
-
-  if (p.includes(".")) {
-    return domainMatches(domain, p);
-  }
-
-  return domain.split(".").includes(p);
+  return false;
 }
 
 export function groupMatches(loc: SiteLocation, matchers: string[]): boolean {
-  return matchers.some((m) => matchKeyword(loc, m));
+  return matchers.some((matcher) => matchKeyword(loc, matcher));
 }
 
-function wildcardToRegex(glob: string): RegExp {
-  const escaped = glob.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
-  return new RegExp(`^${escaped}$`, "i");
+function wildcardToRegex(pattern: string): RegExp {
+  const optionalSubdomain = pattern.startsWith("*.");
+  const glob = optionalSubdomain ? pattern.slice(2) : pattern;
+  const escaped = glob
+    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*/g, ".*")
+    .replace(/\?/g, ".");
+  const prefix = optionalSubdomain
+    ? "^(?:[^/]+\\.)?"
+    : pattern.startsWith("/")
+      ? "^[^/]+"
+      : pattern.split("/", 1)[0].includes(".")
+        ? "^"
+        : "";
+  const suffix = optionalSubdomain && !pattern.includes("/") ? "(?=$|[/?#])" : "";
+  return new RegExp(`${prefix}${escaped}${suffix}`, "i");
+}
+
+function normalize(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .replace(/^www\./, "")
+    .replace(/\/$/, "");
 }

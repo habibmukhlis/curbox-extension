@@ -1,4 +1,6 @@
 import type { BlockDecision } from "../lib/types";
+import { AdaptiveMathChallenge } from "../core/adaptive-math";
+import { msToHuman } from "../lib/time";
 
 const STYLE = `
 :host { all: initial; }
@@ -41,6 +43,7 @@ const STYLE = `
 }
 .body { display: flex; flex-direction: column; gap: 14px; width: 100%; align-items: center; }
 .sentence { font-style: italic; font-size: 15px; opacity: 0.7; max-width: 36ch; margin: 0; }
+.problem { font-size: 24px; margin: 0; font-variant-numeric: tabular-nums; }
 .note { font-size: 14px; opacity: 0.6; margin: 0; }
 input, textarea {
   font-family: inherit;
@@ -210,7 +213,9 @@ export function createOverlay(): Overlay {
     if (!decision.canProceed) {
       body.appendChild(
         makeNote(
-          warning?.challenge === "never"
+          decision.focusGoalRemainingMs > 0
+            ? `Finish ${msToHuman(decision.focusGoalRemainingMs)} more focus time in the selected group today to unlock.`
+            : warning?.challenge === "never"
             ? "This one stays closed for now."
             : "You've used all your passes for now. Come back later.",
         ),
@@ -218,15 +223,19 @@ export function createOverlay(): Overlay {
       return;
     }
 
-    if (warning?.challenge === "effort") {
+    if (warning?.challenge === "effort" && warning.effortType === "typing") {
       const sentence = document.createElement("p");
       sentence.className = "sentence";
       sentence.textContent = warning.sentence;
       const input = document.createElement("input");
       input.setAttribute("autocomplete", "off");
       input.placeholder = "Type it here";
+      // Match Android's typing challenge: the sentence must be entered, not
+      // pasted or dragged in from the target text.
+      input.addEventListener("paste", (event) => event.preventDefault());
+      input.addEventListener("drop", (event) => event.preventDefault());
       const button = makePrimary("Continue", () => !button.disabled && proceed(), true);
-      const check = () => (button.disabled = input.value.trim() !== warning.sentence.trim());
+      const check = () => (button.disabled = normalizeLines(input.value) !== normalizeLines(warning.sentence));
       input.oninput = check;
       body.append(sentence, input, button);
       check();
@@ -234,10 +243,35 @@ export function createOverlay(): Overlay {
       return;
     }
 
+    if (warning?.challenge === "effort" && warning.effortType === "intent") {
+      const input = document.createElement("textarea");
+      input.rows = 3;
+      input.setAttribute("autocomplete", "off");
+      input.placeholder = "Why do you want to continue?";
+      const minimum = Math.max(1, warning.minIntentLength);
+      const note = makeNote("");
+      const button = makePrimary("Continue", () => !button.disabled && proceed(), true);
+      const check = () => {
+        const remaining = Math.max(0, minimum - input.value.trim().length);
+        button.disabled = remaining > 0;
+        note.textContent = remaining > 0 ? `${remaining} more character${remaining === 1 ? "" : "s"} needed` : "";
+      };
+      input.oninput = check;
+      body.append(input, note, button);
+      check();
+      input.focus();
+      return;
+    }
+
+    if (warning?.challenge === "effort" && warning.effortType === "math") {
+      renderMathChallenge(body, warning.mathQuestionCount, warning.mathStartingLevel, proceed);
+      return;
+    }
+
     // Wait to unlock: grant temporary access. Fixed uses the preset minutes;
     // dynamic lets me choose how long right here, then asks again next time.
     const minutes = Math.max(1, warning?.unlockMinutes ?? 15);
-    if (warning?.waitType === "dynamic") {
+    if (decision.reason !== "on-open" && warning?.waitType === "dynamic") {
       const input = document.createElement("input");
       input.type = "number";
       input.min = "1";
@@ -263,6 +297,51 @@ export function createOverlay(): Overlay {
   }
 
   return { show, hide };
+}
+
+function renderMathChallenge(
+  body: HTMLDivElement,
+  questionCount: number,
+  startingLevel: number,
+  proceed: () => void,
+): void {
+  const challenge = new AdaptiveMathChallenge(questionCount, startingLevel);
+  const progress = makeNote("");
+  const problem = document.createElement("p");
+  problem.className = "problem";
+  const input = document.createElement("input");
+  input.inputMode = "decimal";
+  input.placeholder = "Answer";
+  input.setAttribute("autocomplete", "off");
+  const feedback = makeNote("");
+  const button = makePrimary("Check answer", submit);
+
+  function refresh(): void {
+    problem.textContent = challenge.currentProblem.expression;
+    progress.textContent = `${challenge.solvedCount} of ${Math.max(1, questionCount)} solved`;
+    input.value = "";
+    input.focus();
+  }
+
+  function submit(): void {
+    const result = challenge.submit(input.value);
+    if (result.complete) {
+      proceed();
+      return;
+    }
+    feedback.textContent = result.correct ? "Correct. Here's the next one." : "Not quite. The next one will be a little easier.";
+    refresh();
+  }
+
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") submit();
+  });
+  body.append(progress, problem, input, feedback, button);
+  refresh();
+}
+
+function normalizeLines(value: string): string {
+  return value.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 }
 
 // Keep keyboard focus inside the overlay and let Escape lead somewhere calmer.

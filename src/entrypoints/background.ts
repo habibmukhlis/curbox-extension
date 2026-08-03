@@ -1,13 +1,12 @@
 import { defineBackground, browser } from "#imports";
 import { get, watch } from "../lib/storage";
-import { todayKey, nowMinutes } from "../lib/time";
 import { parseLocation, type SiteLocation } from "../lib/url";
 import type { BlockDecision, FocusSession } from "../lib/types";
 import type { ContentMessage } from "../lib/messages";
 import { sendToTab } from "../lib/messages";
 import { evaluate, PASS } from "../core/blocker";
 import { activeSession, endSession } from "../core/focus";
-import { clearOnOpenGrants, pruneGrants, recordProceed } from "../core/grants";
+import { clearExitedOnOpenGrants, pruneGrants, recordProceed } from "../core/grants";
 import {
   persist,
   startTracking,
@@ -62,6 +61,9 @@ async function handleSync(req: SyncRequest): Promise<SyncResponse> {
       case "sync:setDeviceName":
         await sync.setDeviceName(req.name);
         break;
+      case "sync:syncNow":
+        await sync.syncNow();
+        break;
       case "sync:setPreferences":
         await sync.setPreferences(req.preferences);
         break;
@@ -94,22 +96,22 @@ function friendlyError(err: unknown): string {
 }
 
 async function decide(location: SiteLocation): Promise<BlockDecision> {
-  const [settings, usage, grants, proceeds, focus] = await Promise.all([
+  const [settings, usage, grants, proceeds, focus, focusLog] = await Promise.all([
     get("settings"),
     get("usage"),
     get("grants"),
     get("proceeds"),
     activeSession(),
+    get("focusLog"),
   ]);
-  const now = new Date();
+  const now = Date.now();
   return evaluate({
     location,
     settings,
     focus,
-    todayUsage: usage[todayKey()] ?? {},
-    weekday: now.getDay(),
-    nowMinutes: nowMinutes(now),
-    now: now.getTime(),
+    usage,
+    focusLog,
+    now,
     grants,
     proceeds,
   });
@@ -117,6 +119,7 @@ async function decide(location: SiteLocation): Promise<BlockDecision> {
 
 async function evaluateTab(tabId: number, url: string | undefined, makeActive: boolean): Promise<void> {
   const location = url ? parseLocation(url) : null;
+  if (makeActive) await clearExitedOnOpenGrants(location);
   if (!location) {
     if (makeActive) stopTracking();
     sendToTab(tabId, { type: "evaluate", decision: PASS });
@@ -178,7 +181,7 @@ function applyIdleState(state: "active" | "idle" | "locked"): void {
 }
 
 export default defineBackground(() => {
-  void sync.start();
+  void sync.start().catch(() => undefined);
 
   // Smallest interval the API allows, so a closed lid stops counting promptly.
   browser.idle.setDetectionInterval(15);
@@ -195,7 +198,7 @@ export default defineBackground(() => {
         void persist();
         void evaluateFocused();
       });
-      void sync.pullSinceCursor();
+      void sync.pullSinceCursor().catch(() => undefined);
     } else if (alarm.name === "focus-end") {
       void activeSession().then(() => evaluateAllTabs());
     } else if (alarm.name === "grant-end") {
@@ -229,6 +232,7 @@ export default defineBackground(() => {
       scheduleFocusEnd(changed.focus ?? null);
       void evaluateAllTabs();
     }
+    if ("focusLog" in changed) void evaluateAllTabs();
     if ("settings" in changed) void evaluateAllTabs();
     if ("grants" in changed) scheduleGrantEnd(changed.grants ?? {});
   });
@@ -246,11 +250,8 @@ export default defineBackground(() => {
       void setTabAudible(changeInfo.audible);
     }
     if (changeInfo.url) {
-      const location = parseLocation(changeInfo.url);
-      if (location) {
-        void clearOnOpenGrants(location).then(() => evaluateTab(tabId, tab.url, tabId === focusedTabId));
-        return;
-      }
+      void evaluateTab(tabId, tab.url, tabId === focusedTabId);
+      return;
     }
     if (changeInfo.status === "complete") {
       void evaluateTab(tabId, tab.url, tabId === focusedTabId);
@@ -287,9 +288,7 @@ export default defineBackground(() => {
     }
     if (message.type === "navigated") {
       if (tabId != null) {
-        const location = parseLocation(message.url);
-        const after = location ? clearOnOpenGrants(location) : Promise.resolve();
-        void after.then(() => evaluateTab(tabId, message.url, tabId === focusedTabId));
+        void evaluateTab(tabId, message.url, tabId === focusedTabId);
       }
       return;
     }

@@ -47,6 +47,7 @@ describe("usage tracker", () => {
     expect(await domainMs("youtube.com")).toBe(10_000);
     const usage = await get("usage");
     expect(usage[dateKey(new Date())]["youtube.com"].paths["/watch?v=abc"]).toBe(10_000);
+    expect(usage[dateKey(new Date())]["youtube.com"].pathHours?.["/watch?v=abc"]?.[12]).toBe(10_000);
   });
 
   it("does not bank time while the window is unfocused, even when tracking restarts", async () => {
@@ -108,6 +109,8 @@ describe("usage tracker", () => {
     const usage = await get("usage");
     expect(usage["2026-06-15"]["youtube.com"].ms).toBe(30_000);
     expect(usage["2026-06-16"]["youtube.com"].ms).toBe(30_000);
+    expect(usage["2026-06-15"]["youtube.com"].hours?.[23]).toBe(30_000);
+    expect(usage["2026-06-16"]["youtube.com"].hours?.[0]).toBe(30_000);
   });
 
   it("discards a span longer than the suspend gap", async () => {

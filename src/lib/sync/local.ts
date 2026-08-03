@@ -10,6 +10,7 @@ const K_VAULT = "sync.vaultMeta";
 const K_REMOTE_USAGE = "sync.remoteUsage";
 const K_REMOTE_USAGE_VIEW = "sync.remoteUsageView";
 const K_PREFERENCES = "sync.preferences";
+const K_FOCUS_GROUP_IDS = "sync.focusGroupIds";
 const DEFAULT_PREFERENCES: SyncPreferences = { usageStats: true, reducerConfigs: true, usageDeviceIds: [] };
 
 export interface VaultMeta {
@@ -37,8 +38,18 @@ export async function getDeviceId(): Promise<string> {
   return id;
 }
 
-export const getCursor = () => read<string>(K_CURSOR);
-export const setCursor = (cursor: string) => write(K_CURSOR, cursor);
+export interface SyncCursor {
+  updatedAt: string;
+  id: string;
+}
+
+export async function getCursor(): Promise<SyncCursor> {
+  const stored = await read<string | SyncCursor>(K_CURSOR);
+  if (typeof stored === "string") return { updatedAt: stored, id: "" };
+  return stored ?? { updatedAt: "1970-01-01T00:00:00Z", id: "" };
+}
+export const setCursor = (cursor: SyncCursor | string) =>
+  write(K_CURSOR, typeof cursor === "string" ? { updatedAt: cursor, id: "" } : cursor);
 
 export const getStoredDek = () => read<string>(K_DEK);
 export const setStoredDek = (dekB64: string) => write(K_DEK, dekB64);
@@ -53,7 +64,19 @@ export const getSyncPreferences = async (): Promise<SyncPreferences> => ({
   ...((await read<Partial<SyncPreferences>>(K_PREFERENCES)) ?? {}),
 });
 export const setSyncPreferences = (preferences: SyncPreferences) => write(K_PREFERENCES, preferences);
+export const getKnownFocusGroupIds = async (): Promise<string[]> => (await read<string[]>(K_FOCUS_GROUP_IDS)) ?? [];
+export const setKnownFocusGroupIds = (ids: Iterable<string>) => write(K_FOCUS_GROUP_IDS, [...new Set(ids)]);
 
 export async function clearSyncState(): Promise<void> {
-  await browser.storage.local.remove([K_CURSOR, K_DEK, K_VAULT, K_REMOTE_USAGE, K_REMOTE_USAGE_VIEW]);
+  const preferences = await getSyncPreferences();
+  await browser.storage.local.remove([
+    K_DEVICE_ID,
+    K_CURSOR,
+    K_DEK,
+    K_VAULT,
+    K_REMOTE_USAGE,
+    K_REMOTE_USAGE_VIEW,
+    K_FOCUS_GROUP_IDS,
+  ]);
+  await setSyncPreferences({ ...preferences, usageDeviceIds: [] });
 }

@@ -1,7 +1,7 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import QRCode from "qrcode";
 import { useSync } from "./useSync";
-import type { SyncStatus } from "../../lib/sync/types";
+import { DEFAULT_SYNC_PREFERENCES, NO_SYNC_USAGE_DEVICE, type SyncStatus } from "../../lib/sync/types";
 
 type Run = ReturnType<typeof useSync>["run"];
 type Mode = "signin" | "signup" | "forgot" | "reset";
@@ -24,7 +24,7 @@ export function AccountPanel() {
     </div>
   );
 
-  if (status.unlocked) return <Unlocked status={status} busy={busy} run={run} />;
+  if (status.unlocked) return <Unlocked status={status} busy={busy} error={error} run={run} />;
   if (status.signedIn) return <Passphrase status={status} busy={busy} error={error} run={run} />;
 
   if (status.pendingEmail) {
@@ -247,18 +247,32 @@ function Passphrase({
   );
 }
 
-function Unlocked({ status, busy, run }: { status: SyncStatus; busy: boolean; run: Run }) {
+function Unlocked({ status, busy, error, run }: { status: SyncStatus; busy: boolean; error: string | null; run: Run }) {
   const [qr, setQr] = useState<string | null>(null);
-  const [deviceName, setDeviceName] = useState(status.devices.find((d) => d.current)?.label ?? "");
-  const prefs = status.preferences;
+  const [pairingCode, setPairingCode] = useState<string | null>(null);
+  const devices = status.devices ?? [];
+  const currentDeviceName = devices.find((device) => device.current)?.label ?? "";
+  const [deviceName, setDeviceName] = useState(currentDeviceName);
+  const prefs = status.preferences ?? DEFAULT_SYNC_PREFERENCES;
+  const noneSelected = prefs.usageDeviceIds.includes(NO_SYNC_USAGE_DEVICE);
+
+  useEffect(() => {
+    if (currentDeviceName) setDeviceName((previous) => previous || currentDeviceName);
+  }, [currentDeviceName]);
 
   const savePrefs = (next: Partial<typeof prefs>) =>
     void run({ type: "sync:setPreferences", preferences: { ...prefs, ...next } });
 
   const showCode = async () => {
     const res = await run({ type: "sync:makePairingCode" });
-    if (res.pairingCode) setQr(await QRCode.toDataURL(res.pairingCode, { margin: 1, width: 220 }));
-    setTimeout(() => setQr(null), 60000);
+    if (res.pairingCode) {
+      setPairingCode(res.pairingCode);
+      setQr(await QRCode.toDataURL(res.pairingCode, { margin: 1, width: 220 }));
+    }
+    setTimeout(() => {
+      setQr(null);
+      setPairingCode(null);
+    }, 60000);
   };
 
   return (
@@ -268,10 +282,14 @@ function Unlocked({ status, busy, run }: { status: SyncStatus; busy: boolean; ru
         <p className="font-display text-3xl leading-none">Sync is on</p>
       </div>
       <p className="text-sm text-muted">{status.email}</p>
+      {error && <Banner text={error} />}
       <p className="text-xs text-muted">
         {status.lastSync ? `Last synced ${new Date(status.lastSync).toLocaleTimeString()}` : "Waiting for first sync"}
         {status.error ? ` · ${status.error}` : ""}
       </p>
+      <div>
+        <Btn ghost busy={busy} onClick={() => void run({ type: "sync:syncNow" })}>Sync now</Btn>
+      </div>
 
       <div className="border-t border-line pt-4">
         <p className="label mb-2">This device</p>
@@ -286,27 +304,33 @@ function Unlocked({ status, busy, run }: { status: SyncStatus; busy: boolean; ru
         <p className="label mb-3">What syncs</p>
         <label className="mb-3 flex items-center justify-between gap-4 text-sm">
           <span><b className="font-medium">Usage stats</b><small className="block text-muted">Share and combine time spent across devices</small></span>
-          <input type="checkbox" checked={prefs.usageStats} onChange={(e) => savePrefs({ usageStats: e.target.checked })} />
+          <input type="checkbox" disabled={busy} checked={prefs.usageStats} onChange={(e) => savePrefs({ usageStats: e.target.checked })} />
         </label>
         <label className="flex items-center justify-between gap-4 text-sm">
           <span><b className="font-medium">Reducer configs</b><small className="block text-muted">Keep blockers and focus groups in step</small></span>
-          <input type="checkbox" checked={prefs.reducerConfigs} onChange={(e) => savePrefs({ reducerConfigs: e.target.checked })} />
+          <input type="checkbox" disabled={busy} checked={prefs.reducerConfigs} onChange={(e) => savePrefs({ reducerConfigs: e.target.checked })} />
         </label>
       </div>
 
-      {prefs.usageStats && status.devices.length > 0 && (
+      {prefs.usageStats && devices.some((device) => !device.current) && (
         <div className="border-t border-line pt-4">
           <p className="label mb-1">Usage shown from</p>
           <p className="mb-3 text-xs text-muted">Choose which other devices contribute to combined usage.</p>
           <label className="mb-2 flex items-center gap-2 text-sm">
-            <input type="radio" checked={prefs.usageDeviceIds.length === 0} onChange={() => savePrefs({ usageDeviceIds: [] })} /> All devices
+            <input type="radio" disabled={busy} checked={prefs.usageDeviceIds.length === 0} onChange={() => savePrefs({ usageDeviceIds: [] })} /> All devices
           </label>
-          {status.devices.filter((d) => !d.current).map((device) => (
+          <label className="mb-2 flex items-center gap-2 text-sm">
+            <input type="radio" disabled={busy} checked={noneSelected} onChange={() => savePrefs({ usageDeviceIds: [NO_SYNC_USAGE_DEVICE] })} /> No other devices
+          </label>
+          {devices.filter((d) => !d.current).map((device) => (
             <label key={device.id} className="mb-2 flex items-center gap-2 text-sm">
-              <input type="checkbox" checked={prefs.usageDeviceIds.includes(device.id)}
+              <input type="checkbox" disabled={busy} checked={prefs.usageDeviceIds.includes(device.id)}
                 onChange={(e) => savePrefs({ usageDeviceIds: e.target.checked
-                  ? [...prefs.usageDeviceIds, device.id]
-                  : prefs.usageDeviceIds.filter((id) => id !== device.id) })} />
+                  ? [...prefs.usageDeviceIds.filter((id) => id !== NO_SYNC_USAGE_DEVICE), device.id]
+                  : (() => {
+                    const selected = prefs.usageDeviceIds.filter((id) => id !== device.id && id !== NO_SYNC_USAGE_DEVICE);
+                    return selected.length ? selected : [NO_SYNC_USAGE_DEVICE];
+                  })() })} />
               <span>{device.label}<small className="ml-2 text-muted">{device.platform}</small></span>
             </label>
           ))}
@@ -316,11 +340,16 @@ function Unlocked({ status, busy, run }: { status: SyncStatus; busy: boolean; ru
       <div className="border-t border-line pt-4">
         <p className="label mb-2">Add another device</p>
         <p className="mb-3 text-xs text-muted">
-          Scan this on your phone or another browser to bring it in without typing your phrase. Anyone who sees this
-          can read your data, so only show it to your own devices.
+          Scan this on your phone, or copy the code into another browser, to bring it in without typing your phrase.
+          Anyone who sees this can read your data, so only show it to your own devices.
         </p>
-        {qr ? (
-          <img src={qr} alt="Pairing code" className="rounded-lg border border-line" />
+        {qr && pairingCode ? (
+          <div className="flex flex-col items-start gap-2">
+            <img src={qr} alt="Pairing code" className="rounded-lg border border-line" />
+            <textarea readOnly value={pairingCode} rows={3} aria-label="Pairing code text"
+              className="w-full rounded-lg border border-line bg-surface-2 px-3 py-2 font-mono text-xs text-ink" />
+            <Btn ghost onClick={() => void navigator.clipboard.writeText(pairingCode)}>Copy pairing code</Btn>
+          </div>
         ) : (
           <Btn ghost busy={busy} onClick={() => void showCode()}>
             Show pairing code

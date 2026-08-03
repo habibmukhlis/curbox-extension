@@ -2,6 +2,7 @@ export const NS_EXT_CONFIG = "ext_config";
 export const NS_USAGE_WEB = "usage_web";
 export const NS_FOCUS = "focus_state";
 export const NS_FOCUS_GROUPS = "focus_groups";
+export const NO_SYNC_USAGE_DEVICE = "__curbox_no_sync_usage_device__";
 
 export interface FocusGroupPayload {
   id: string;
@@ -52,6 +53,69 @@ export interface SyncPreferences {
   usageDeviceIds: string[];
 }
 
+export const DEFAULT_SYNC_PREFERENCES: SyncPreferences = {
+  usageStats: true,
+  reducerConfigs: true,
+  usageDeviceIds: [],
+};
+
+function record(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
+}
+
+function nullableString(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+/**
+ * Runtime messages can briefly cross extension versions after an update: an
+ * already-open options page may talk to an older background worker (or the
+ * reverse). Keep that wire-format mismatch from crashing the account screen.
+ */
+export function normalizeSyncStatus(value: unknown): SyncStatus {
+  const raw = record(value);
+  const rawPreferences = record(raw.preferences);
+  const unlocked = raw.unlocked === true;
+  const usageDeviceIds = Array.isArray(rawPreferences.usageDeviceIds)
+    ? [...new Set(rawPreferences.usageDeviceIds.filter((id): id is string => typeof id === "string"))]
+    : [];
+  const devices = Array.isArray(raw.devices)
+    ? raw.devices.flatMap((value): SyncDevice[] => {
+        const device = record(value);
+        if (typeof device.id !== "string") return [];
+        const platform = typeof device.platform === "string" ? device.platform : "device";
+        return [{
+          id: device.id,
+          platform,
+          label: typeof device.label === "string" ? device.label : platform,
+          lastSeen: nullableString(device.lastSeen),
+          current: device.current === true,
+        }];
+      })
+    : [];
+
+  return {
+    signedIn: unlocked || raw.signedIn === true,
+    email: nullableString(raw.email),
+    hasVault: unlocked || raw.hasVault === true,
+    unlocked,
+    deviceId: nullableString(raw.deviceId),
+    lastSync: typeof raw.lastSync === "number" && Number.isFinite(raw.lastSync) ? raw.lastSync : null,
+    error: nullableString(raw.error),
+    pendingEmail: nullableString(raw.pendingEmail),
+    devices,
+    preferences: {
+      usageStats: typeof rawPreferences.usageStats === "boolean"
+        ? rawPreferences.usageStats
+        : DEFAULT_SYNC_PREFERENCES.usageStats,
+      reducerConfigs: typeof rawPreferences.reducerConfigs === "boolean"
+        ? rawPreferences.reducerConfigs
+        : DEFAULT_SYNC_PREFERENCES.reducerConfigs,
+      usageDeviceIds,
+    },
+  };
+}
+
 export interface UsageWebPayload {
   date: string;
   platform: string;
@@ -72,6 +136,7 @@ export type SyncRequest =
   | { type: "sync:makePairingCode" }
   | { type: "sync:pairWithCode"; payload: string }
   | { type: "sync:setDeviceName"; name: string }
+  | { type: "sync:syncNow" }
   | { type: "sync:setPreferences"; preferences: SyncPreferences };
 
 export interface SyncResponse {

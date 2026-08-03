@@ -28,11 +28,11 @@ See where your time actually goes. Curbox only counts a tab while you are lookin
 
 ### Website Blocker
 
-Put websites into groups and pause each group one of three ways:
+Put websites into groups and combine the same controls used by the Android app:
 
-- **Usage Based.** The site blocks once you go over a daily time limit you set.
-- **Time Based.** The site blocks during the hours you pick, like work time or late at night.
-- **On each open.** Curbox stops you for a quick check in every time you open it.
+- **Active hours.** Choose all day, one daily schedule, or different ranges by weekday.
+- **Usage limits.** Count only browsing inside those active hours; a zero-minute limit blocks the whole window.
+- **On each open.** Curbox stops you once when you enter a group, then asks again after you leave and return.
 
 ### Keyword Blocker
 
@@ -48,10 +48,14 @@ Block by URL pattern instead of a whole domain, so you can kill the feed and kee
 This is what you hit when you try to get past a block. Instead of a flat wall there is a breathing overlay that asks you to slow down for a second. You decide how hard it pushes back:
 
 - **Never unlock.** The block holds and there is no way through.
-- **Require effort.** Type out a sentence or write down why you want in.
+- **Require effort.** Type a sentence, write down why you want in, or solve an adaptive math set.
 - **Wait to unlock.** A timer runs before the page will open.
 
-You can add your own message and cap how many times you are allowed through, so it stays a pause and not a punishment.
+You can add your own message, require completed focus time first, and cap how many times you are allowed through, so it stays a pause and not a punishment.
+
+### Encrypted Sync
+
+Sync browser settings, focus groups and sessions, and four weeks of browsing usage through the same end-to-end encrypted Curbox account used by Android. Device filters, pairing codes, explicit manual sync, deletions, and account-local device identities follow the Android sync contract.
 
 ## Installation
 

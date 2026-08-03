@@ -1,8 +1,8 @@
-import { get, update } from "../lib/storage";
+import { get, set, update } from "../lib/storage";
 import type { SiteLocation } from "../lib/url";
 import { matchingOnOpenGroups } from "./blocker";
 
-const DEFAULT_UNLOCK_MINUTES = 15;
+const DEFAULT_UNLOCK_MINUTES = 2;
 
 export async function pruneGrants(): Promise<void> {
   const now = Date.now();
@@ -17,7 +17,11 @@ export async function recordProceed(groupId: string, minutes?: number): Promise<
   const now = Date.now();
   const settings = await get("settings");
   const group = settings.groups.find((g) => g.id === groupId);
-  const unlockMinutes = minutes && minutes > 0 ? minutes : (group?.warning.unlockMinutes ?? DEFAULT_UNLOCK_MINUTES);
+  const unlockMinutes = group?.onEachOpen
+    ? 24 * 60
+    : minutes && minutes > 0
+      ? minutes
+      : (group?.warning.unlockMinutes ?? DEFAULT_UNLOCK_MINUTES);
   const grantMs = unlockMinutes * 60_000;
 
   await update("grants", (grants) => {
@@ -31,24 +35,34 @@ export async function recordProceed(groupId: string, minutes?: number): Promise<
   await update("proceeds", (proceeds) => {
     const record = proceeds[groupId];
     const windowMs = (group?.warning.proceedWindowMinutes ?? 60) * 60_000;
-    const fresh = record && now - record.windowStart < windowMs;
+    const prior = record?.timestamps ?? (
+      record && now - record.windowStart < windowMs
+        ? Array(Math.max(0, record.count)).fill(record.windowStart)
+        : []
+    );
+    const timestamps = prior.filter((timestamp) => now - timestamp < windowMs);
+    timestamps.push(now);
     return {
       ...proceeds,
-      [groupId]: fresh
-        ? { count: record!.count + 1, windowStart: record!.windowStart }
-        : { count: 1, windowStart: now },
+      [groupId]: { count: timestamps.length, windowStart: timestamps[0] ?? now, timestamps },
     };
   });
 }
 
-// On a real navigation, "on each open" groups should block again, so drop their grant.
-export async function clearOnOpenGrants(location: SiteLocation): Promise<void> {
+// Android keeps an on-each-open grant while the user stays inside any target in
+// that group, and clears it only after leaving the group.
+export async function clearExitedOnOpenGrants(location: SiteLocation | null): Promise<void> {
   const settings = await get("settings");
-  const ids = matchingOnOpenGroups(location, settings);
-  if (ids.length === 0) return;
-  await update("grants", (grants) => {
-    const next = { ...grants };
-    for (const id of ids) delete next[id];
-    return next;
-  });
+  const stillInside = new Set(location ? matchingOnOpenGroups(location, settings) : []);
+  const ids = settings.groups.filter((group) => group.onEachOpen).map((group) => group.id);
+  const grants = await get("grants");
+  const next = { ...grants };
+  let changed = false;
+  for (const id of ids) {
+    if (!stillInside.has(id) && id in next) {
+      delete next[id];
+      changed = true;
+    }
+  }
+  if (changed) await set("grants", next);
 }

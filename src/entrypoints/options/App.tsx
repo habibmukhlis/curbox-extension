@@ -25,8 +25,8 @@ export function App() {
   const [reducerPage, setReducerPage] = useState<ReducerPage>(null);
 
   useEffect(() => {
-    if (ready && !draft) setDraft(settings);
-  }, [ready, settings, draft]);
+    if (ready) setDraft(settings);
+  }, [ready, settings]);
 
   if (!ready || !draft) return null;
 
@@ -63,7 +63,11 @@ export function App() {
               <button className="mb-5 text-sm font-medium text-primary" onClick={() => setReducerPage(null)}>← Reducers</button>
               {reducerPage === "website" ? (
                 <>
-                  <GroupManager groups={draft.groups} onChange={(groups) => commit({ ...draft, groups })} />
+                  <GroupManager
+                    groups={draft.groups}
+                    focusGroups={draft.focusGroups}
+                    onChange={(groups) => commit({ ...draft, groups })}
+                  />
                   <KeywordHelp />
                 </>
               ) : <AccountPanel />}
@@ -99,7 +103,7 @@ function ReducersHome({ onOpen }: { onOpen: (page: Exclude<ReducerPage, null>) =
       <p className="label">Blocker tools</p>
       <button onClick={() => onOpen("website")} className="card flex items-center gap-4 p-5 text-left">
         <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-secondary-chip text-2xl text-on-secondary">⊘</span>
-        <span className="flex-1"><b className="block text-base text-ink">Website Blocker</b><small className="text-muted">Block sites by time, usage, or on each open</small></span><span className="text-faint">›</span>
+        <span className="flex-1"><b className="block text-base text-ink">Website Blocker</b><small className="text-muted">Combine active hours, usage limits, and on-each-open pauses</small></span><span className="text-faint">›</span>
       </button>
       <p className="label mt-3">Across devices</p>
       <button onClick={() => onOpen("sync")} className="card flex items-center gap-4 p-5 text-left">

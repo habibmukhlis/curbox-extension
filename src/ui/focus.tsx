@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { browser } from "#imports";
 import type { FocusGroup, FocusLogEntry, FocusMode, FocusSession } from "../lib/types";
 import { newFocusGroup } from "../lib/types";
 import { dateKey, dayLabel, lastNDays, msToClock, msToHuman } from "../lib/time";
@@ -45,10 +46,22 @@ function StartSession({ groups, onCreate }: { groups: FocusGroup[]; onCreate: ()
   const [groupId, setGroupId] = useState(groups[0]?.id ?? "");
   const [minutes, setMinutes] = useState(25);
 
+  useEffect(() => {
+    void browser.storage.local.get(["ui.lastFocusDuration", "ui.lastFocusGroupId"]).then((stored) => {
+      const savedMinutes = Number(stored["ui.lastFocusDuration"]);
+      const savedGroup = stored["ui.lastFocusGroupId"];
+      if (Number.isFinite(savedMinutes) && savedMinutes >= 1) setMinutes(Math.floor(savedMinutes));
+      if (typeof savedGroup === "string" && groups.some((group) => group.id === savedGroup)) setGroupId(savedGroup);
+    });
+  }, []);
+
   if (groups.length === 0) {
     return (
       <div className="flex min-h-[560px] flex-col justify-end pb-4">
-        <div className="text-center"><span className="font-display tnum text-[128px] leading-none">{minutes}</span><span className="ml-1 text-xl text-muted">mins</span></div>
+        <div className="flex items-end justify-center gap-2 text-center">
+          <input aria-label="Focus duration" type="number" min={1} value={minutes} onChange={(event) => setMinutes(Math.max(1, Math.floor(Number(event.target.value)) || 1))} className="font-display tnum w-56 bg-transparent text-right text-[112px] leading-none outline-none" />
+          <span className="mb-3 text-xl text-muted">mins</span>
+        </div>
         <FocusRuler minutes={minutes} setMinutes={setMinutes} />
         <button onClick={onCreate} className={`mt-10 w-full ${btnPrimary}`}>Create Focus Group</button>
       </div>
@@ -60,7 +73,7 @@ function StartSession({ groups, onCreate }: { groups: FocusGroup[]; onCreate: ()
   return (
     <div className="flex min-h-[560px] flex-col justify-end pb-4">
       <div className="text-center">
-        <span className="font-display tnum text-[128px] leading-none">{minutes}</span>
+        <input aria-label="Focus duration" type="number" min={1} value={minutes} onChange={(event) => setMinutes(Math.max(1, Math.floor(Number(event.target.value)) || 1))} className="font-display tnum w-56 bg-transparent text-right text-[112px] leading-none outline-none" />
         <span className="ml-1 text-xl text-muted">mins</span>
       </div>
       <FocusRuler minutes={minutes} setMinutes={setMinutes} />
@@ -71,7 +84,7 @@ function StartSession({ groups, onCreate }: { groups: FocusGroup[]; onCreate: ()
           </option>
         ))}
       </select>
-      <button onClick={() => void startSession(group, minutes, group.exitable)} className={`mt-8 w-full ${btnPrimary}`}>
+      <button onClick={() => void browser.storage.local.set({ "ui.lastFocusDuration": minutes, "ui.lastFocusGroupId": group.id }).then(() => startSession(group, minutes, group.exitable))} className={`mt-8 w-full ${btnPrimary}`}>
         Start focus
       </button>
     </div>
@@ -84,7 +97,7 @@ function FocusRuler({ minutes, setMinutes }: { minutes: number; setMinutes: (n: 
       <div className="absolute inset-0 flex items-center justify-between px-2" aria-hidden="true">
         {Array.from({ length: 19 }, (_, i) => <span key={i} className={`w-px ${i === 9 ? "h-12 bg-primary" : i % 4 === 0 ? "h-10 bg-muted" : "h-7 bg-faint/60"}`} />)}
       </div>
-      <input aria-label="Focus duration" type="range" min={5} max={120} step={5} value={minutes} onChange={(e) => setMinutes(Number(e.target.value))} className="absolute inset-0 h-full w-full cursor-ew-resize opacity-0" />
+      <input aria-label="Quick focus duration" type="range" min={1} max={240} step={1} value={Math.min(240, minutes)} onChange={(e) => setMinutes(Number(e.target.value))} className="absolute inset-0 h-full w-full cursor-ew-resize opacity-0" />
     </div>
   );
 }

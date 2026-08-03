@@ -1,5 +1,6 @@
 import { browser } from "#imports";
 import type { FocusLogEntry, FocusSession, ProceedRecord, Settings, UsageHistory } from "./types";
+import { normalizeSettings } from "./types";
 
 interface StoreShape {
   usage: UsageHistory;
@@ -12,6 +13,7 @@ interface StoreShape {
 }
 
 export const DEFAULT_SETTINGS: Settings = {
+  schemaVersion: 2,
   groups: [],
   focusGroups: [],
 };
@@ -28,11 +30,19 @@ const DEFAULTS: StoreShape = {
 
 export async function get<K extends keyof StoreShape>(key: K): Promise<StoreShape[K]> {
   const res = await browser.storage.local.get(key);
-  return (res[key] ?? DEFAULTS[key]) as StoreShape[K];
+  const value = res[key] ?? DEFAULTS[key];
+  if (key === "settings") {
+    const normalized = normalizeSettings(value);
+    if (JSON.stringify(normalized) !== JSON.stringify(value)) {
+      await browser.storage.local.set({ settings: normalized });
+    }
+    return normalized as StoreShape[K];
+  }
+  return value as StoreShape[K];
 }
 
 export async function set<K extends keyof StoreShape>(key: K, value: StoreShape[K]): Promise<void> {
-  await browser.storage.local.set({ [key]: value });
+  await browser.storage.local.set({ [key]: key === "settings" ? normalizeSettings(value) : value });
 }
 
 // The sync engine applies remote changes through this so it can recognise its
@@ -67,7 +77,8 @@ export function watch(listener: (changed: Partial<StoreShape>) => void): () => v
   const handler = (changes: Record<string, { newValue?: unknown }>) => {
     const changed: Partial<StoreShape> = {};
     for (const k of Object.keys(changes)) {
-      (changed as Record<string, unknown>)[k] = changes[k].newValue;
+      const value = changes[k].newValue;
+      (changed as Record<string, unknown>)[k] = k === "settings" ? normalizeSettings(value) : value;
     }
     listener(changed);
   };

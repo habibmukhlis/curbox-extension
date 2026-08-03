@@ -1,11 +1,10 @@
 import { useState } from "react";
-import type { BlockGroup } from "../../lib/types";
+import type { BlockGroup, FocusGroup } from "../../lib/types";
 import { newGroup } from "../../lib/types";
 import { Toggle, btnOutline } from "../components";
-import { MODE_LABEL } from "./constants";
 import { GroupEditor } from "./GroupEditor";
 
-export function GroupManager({ groups, onChange }: { groups: BlockGroup[]; onChange: (groups: BlockGroup[]) => void }) {
+export function GroupManager({ groups, focusGroups, onChange }: { groups: BlockGroup[]; focusGroups: FocusGroup[]; onChange: (groups: BlockGroup[]) => void }) {
   // Edit a draft copy and only commit on Done, so a new group is saved exactly
   // once and cancelling leaves nothing behind.
   const [editing, setEditing] = useState<{ group: BlockGroup; isNew: boolean } | null>(null);
@@ -14,6 +13,7 @@ export function GroupManager({ groups, onChange }: { groups: BlockGroup[]; onCha
     return (
       <GroupEditor
         group={editing.group}
+        focusGroups={focusGroups}
         onSave={(next) => {
           onChange(editing.isNew ? [...groups, next] : groups.map((g) => (g.id === next.id ? next : g)));
           setEditing(null);
@@ -31,7 +31,7 @@ export function GroupManager({ groups, onChange }: { groups: BlockGroup[]; onCha
           <button className="-mx-2 flex-1 rounded-xl px-2 py-1 text-left transition-colors hover:bg-state" onClick={() => setEditing({ group, isNew: false })}>
             <p className="text-sm">{group.name}</p>
             <p className="text-xs text-muted">
-              {group.matchers.length} site{group.matchers.length === 1 ? "" : "s"} · {MODE_LABEL[group.mode]}
+              {group.matchers.length} site{group.matchers.length === 1 ? "" : "s"} · {group.onEachOpen ? "On each open" : "Scheduled usage"}
             </p>
           </button>
           <div className="flex items-center gap-3 pl-3">

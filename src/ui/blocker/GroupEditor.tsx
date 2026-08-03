@@ -1,17 +1,18 @@
 import { useState } from "react";
-import type { BlockGroup } from "../../lib/types";
-import { Segmented, btnPrimary, btnOutline, btnGhost, inputCls } from "../components";
+import type { BlockGroup, FocusGroup } from "../../lib/types";
+import { btnPrimary, btnOutline, btnGhost, inputCls } from "../components";
 import { useDraft } from "../useDraft";
-import { MODE_OPTIONS } from "./constants";
 import { ScheduleEditor } from "./ScheduleEditor";
 import { WarningEditor } from "./WarningEditor";
 
 export function GroupEditor({
   group,
+  focusGroups,
   onSave,
   onCancel,
 }: {
   group: BlockGroup;
+  focusGroups: FocusGroup[];
   onSave: (group: BlockGroup) => void;
   onCancel: () => void;
 }) {
@@ -63,16 +64,15 @@ export function GroupEditor({
         </div>
       </div>
 
-      <div className="flex flex-col gap-2">
-        <p className="label">Blocking</p>
-        <Segmented value={draft.mode} options={MODE_OPTIONS} onChange={(mode) => patch({ mode })} />
-      </div>
+      <ScheduleEditor schedule={draft.schedule} onChange={(schedule) => patch({ schedule })} />
 
-      {draft.mode !== "on-open" && (
-        <ScheduleEditor mode={draft.mode} schedule={draft.schedule} onChange={(schedule) => patch({ schedule })} />
-      )}
-
-      <WarningEditor warning={draft.warning} onChange={(warning) => patch({ warning })} />
+      <WarningEditor
+        warning={draft.warning}
+        onChange={(warning) => patch({ warning })}
+        onEachOpen={draft.onEachOpen}
+        onChangeOnEachOpen={(onEachOpen) => patch({ onEachOpen, mode: onEachOpen ? "on-open" : "usage" })}
+        focusGroups={focusGroups}
+      />
 
       <div className="flex items-center gap-4">
         <button onClick={() => onSave({ ...draft, name: draft.name.trim() || "Untitled" })} className={btnPrimary}>

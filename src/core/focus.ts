@@ -1,14 +1,18 @@
 import { get, set, update } from "../lib/storage";
-import { todayKey } from "../lib/time";
+import { dateKey } from "../lib/time";
 import type { FocusGroup, FocusSession } from "../lib/types";
+
+let finalizeQueue: Promise<void> = Promise.resolve();
 
 export async function startSession(group: FocusGroup, durationMin: number, exitable: boolean): Promise<FocusSession> {
   const now = Date.now();
-  const plannedMs = durationMin * 60_000;
+  const safeMinutes = Math.max(1, Math.floor(durationMin));
+  const plannedMs = Math.min(Number.MAX_SAFE_INTEGER - now, safeMinutes * 60_000);
   const session: FocusSession = {
     groupId: group.id,
     name: group.name,
     domains: group.domains,
+    packages: group.packages ?? [],
     mode: group.mode,
     startedAt: now,
     endsAt: now + plannedMs,
@@ -26,7 +30,9 @@ async function logSession(focus: FocusSession, completed: boolean): Promise<void
     [
       {
         at: now,
-        day: todayKey(),
+        day: dateKey(new Date(focus.startedAt)),
+        startedAt: focus.startedAt,
+        endedAt: Math.min(now, focus.endsAt),
         groupId: focus.groupId,
         name: focus.name,
         plannedMs: focus.plannedMs,
@@ -38,18 +44,27 @@ async function logSession(focus: FocusSession, completed: boolean): Promise<void
   );
 }
 
+async function finalizeSession(expected?: FocusSession): Promise<void> {
+  const run = finalizeQueue.then(async () => {
+    const focus = await get("focus");
+    if (!focus || (expected && focus.startedAt !== expected.startedAt)) return;
+    await logSession(focus, Date.now() >= focus.endsAt);
+    await set("focus", null);
+  });
+  finalizeQueue = run.catch(() => undefined);
+  await run;
+}
+
 export async function endSession(): Promise<void> {
   const focus = await get("focus");
-  if (focus) await logSession(focus, Date.now() >= focus.endsAt);
-  await set("focus", null);
+  if (focus) await finalizeSession(focus);
 }
 
 export async function activeSession(): Promise<FocusSession | null> {
   const focus = await get("focus");
   if (!focus) return null;
   if (Date.now() >= focus.endsAt) {
-    await logSession(focus, true);
-    await set("focus", null);
+    await finalizeSession(focus);
     return null;
   }
   return focus;

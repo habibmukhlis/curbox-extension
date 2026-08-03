@@ -8,6 +8,7 @@ import {
   encryptRecord,
   fromBase64Url,
   importDEK,
+  parsePairingPayload,
   recordAad,
   toHex,
   unwrapDEK,
@@ -65,5 +66,14 @@ describe("crypto parity vectors", () => {
 
     expect(expected.kekHex).toHaveLength(64);
     expect(fromBase64Url("AQID")).toEqual(new Uint8Array([1, 2, 3]));
+  });
+
+  it("rejects unsafe wire parameters before invoking WebCrypto", async () => {
+    await expect(importDEK(new Uint8Array(31))).rejects.toThrow("invalid encryption key length");
+    await expect(deriveKEKBytes("phrase", new Uint8Array(7), VECTORS.params)).rejects.toThrow("invalid salt length");
+    await expect(
+      deriveKEKBytes("phrase", new Uint8Array(16), { ...VECTORS.params, iterations: 2_000_001 }),
+    ).rejects.toThrow("invalid key derivation work factor");
+    expect(() => parsePairingPayload("x".repeat(2049))).toThrow("pairing code is too large");
   });
 });

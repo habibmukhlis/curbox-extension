@@ -17,26 +17,31 @@ import {
   parsePairingPayload,
 } from "../crypto";
 import { getSupabase } from "../supabase";
-import { dateKey, todayKey } from "../time";
+import { dateKey } from "../time";
 import { get, isApplyingRemote, setFromRemote, watch } from "../storage";
 import type { FocusGroup, FocusMode, FocusSession, Settings, UsageHistory } from "../types";
+import { normalizeSettings } from "../types";
 import {
   clearSyncState,
   getCursor,
   getDeviceId,
+  getKnownFocusGroupIds,
   getRemoteUsage,
   getSyncPreferences,
   getStoredDek,
   getVaultMeta,
   setCursor,
+  setKnownFocusGroupIds,
   setRemoteUsage,
   setSyncPreferences,
   setStoredDek,
   setVaultMeta,
+  type SyncCursor,
   type VaultMeta,
 } from "./local";
 import {
   canonicalFocusGroupJson,
+  NO_SYNC_USAGE_DEVICE,
   NS_EXT_CONFIG,
   NS_FOCUS,
   NS_FOCUS_GROUPS,
@@ -52,6 +57,7 @@ const PLATFORM = "ext";
 const PUSH_DEBOUNCE_MS = 1500;
 
 interface SyncRow {
+  id: string;
   namespace: string;
   record_key: string;
   device_id: string | null;
@@ -72,16 +78,19 @@ export class SyncEngine {
   private usagePushTimer: ReturnType<typeof setTimeout> | null = null;
   private lastConfigJson: string | null = null; // echo suppression for config
   private lastFocusJson: string | null = null; // echo suppression for focus
-  private lastUsageJson: string | null = null; // dedup: skip re-pushing an unchanged day
+  private usageShadows = new Map<string, string>(); // canonical JSON per retained local day
   // Last synced canonical JSON per focus group id, so we only push real changes
   // and never bounce an applied remote group straight back up.
   private focusGroupShadow = new Map<string, string>();
+  private knownFocusGroupIds = new Set<string>();
   private lastSync: number | null = null;
   private lastError: string | null = null;
   private pendingEmail: string | null = null;
   private starting = false;
   private preferences: SyncPreferences = { usageStats: true, reducerConfigs: true, usageDeviceIds: [] };
   private devices: SyncDevice[] = [];
+  private pullQueue: Promise<void> = Promise.resolve();
+  private signedInInit: Promise<void> | null = null;
 
   async start(): Promise<void> {
     if (this.starting) return;
@@ -91,7 +100,7 @@ export class SyncEngine {
 
     this.sb.auth.onAuthStateChange((_event, session) => {
       this.userId = session?.user.id ?? null;
-      if (this.userId) void this.onSignedIn();
+      if (this.userId) void this.onSignedIn().catch((err) => this.recordError(err));
       else void this.teardown();
     });
 
@@ -103,11 +112,39 @@ export class SyncEngine {
       if (isApplyingRemote()) return;
       if ("settings" in changed) this.scheduleConfigPush();
       if ("usage" in changed) this.scheduleUsagePush();
-      if ("focus" in changed) void this.pushFocus();
+      if ("focus" in changed) void this.pushFocus().catch((err) => this.recordError(err));
     });
   }
 
   private async onSignedIn(): Promise<void> {
+    if (this.signedInInit) return this.signedInInit;
+    const run = this.initializeSignedIn();
+    this.signedInInit = run;
+    try {
+      await run;
+    } finally {
+      if (this.signedInInit === run) this.signedInInit = null;
+    }
+  }
+
+  private async initializeSignedIn(): Promise<void> {
+    const localVault = await getVaultMeta();
+    if (localVault && localVault.userId !== this.userId) {
+      // A browser profile can authenticate a different account without the old
+      // session completing its sign-out callback. Never reuse that account's
+      // device identity, key envelope, cursor, or decrypted usage cache.
+      await clearSyncState();
+      this.deviceId = null;
+      this.dek = null;
+      this.dekBytes = null;
+      this.lastConfigJson = null;
+      this.lastFocusJson = null;
+      this.usageShadows.clear();
+      this.focusGroupShadow.clear();
+      this.knownFocusGroupIds.clear();
+      this.preferences = await getSyncPreferences();
+    }
+    if (!this.deviceId) this.deviceId = await getDeviceId();
     const stored = await getStoredDek();
     if (stored) {
       this.dekBytes = fromBase64Url(stored);
@@ -115,6 +152,7 @@ export class SyncEngine {
     }
     await this.registerDevice();
     await this.refreshDevices();
+    this.knownFocusGroupIds = new Set(await getKnownFocusGroupIds());
     if (this.dek) {
       await this.subscribe();
       await this.pullSinceCursor();
@@ -126,6 +164,10 @@ export class SyncEngine {
   }
 
   private async teardown(): Promise<void> {
+    if (this.configPushTimer) clearTimeout(this.configPushTimer);
+    if (this.usagePushTimer) clearTimeout(this.usagePushTimer);
+    this.configPushTimer = null;
+    this.usagePushTimer = null;
     if (this.channel) {
       await this.sb.removeChannel(this.channel);
       this.channel = null;
@@ -179,13 +221,21 @@ export class SyncEngine {
   }
 
   async signOut(): Promise<void> {
-    await this.sb.auth.signOut();
+    await this.sb.auth.signOut({ scope: "local" });
+    // Let an already-running pull finish before clearing so it cannot restore
+    // decrypted cache entries after the account has been removed locally.
+    await this.pullQueue.catch(() => undefined);
     await clearSyncState();
     this.lastConfigJson = null;
     this.lastFocusJson = null;
-    this.lastUsageJson = null;
+    this.usageShadows.clear();
     this.focusGroupShadow.clear();
+    this.knownFocusGroupIds.clear();
+    this.deviceId = null;
+    this.devices = [];
+    this.preferences = { ...this.preferences, usageDeviceIds: [] };
     this.lastSync = null;
+    this.lastError = null;
     this.pendingEmail = null;
   }
 
@@ -212,6 +262,8 @@ export class SyncEngine {
   // and store the envelope on the server.
   async setPassphrase(passphrase: string): Promise<void> {
     if (!this.userId) throw new Error("sign in first");
+    if (passphrase.length < 8) throw new Error("use at least 8 characters for the secret phrase");
+    if (passphrase.length > 1024) throw new Error("secret phrase is too long");
     const existing = await this.fetchVault();
     if (existing) throw new Error("a passphrase already exists, unlock instead");
 
@@ -240,6 +292,7 @@ export class SyncEngine {
 
   async unlock(passphrase: string): Promise<void> {
     if (!this.userId) throw new Error("sign in first");
+    if (passphrase.length > 1024) throw new Error("secret phrase is too long");
     const meta = (await this.fetchVault()) ?? (await getVaultMeta());
     if (!meta) throw new Error("no passphrase set yet");
     const kek = await deriveKEK(passphrase, fromBase64Url(meta.saltB64), meta.params);
@@ -279,7 +332,7 @@ export class SyncEngine {
 
   private async registerDevice(): Promise<void> {
     if (!this.userId || !this.deviceId) return;
-    await this.sb.from("devices").upsert(
+    const { error } = await this.sb.from("devices").upsert(
       {
         id: this.deviceId,
         user_id: this.userId,
@@ -289,6 +342,7 @@ export class SyncEngine {
       },
       { onConflict: "id" },
     );
+    if (error) throw error;
   }
 
   private async refreshDevices(): Promise<void> {
@@ -313,9 +367,13 @@ export class SyncEngine {
   }
 
   async setPreferences(preferences: SyncPreferences): Promise<void> {
-    this.preferences = { ...preferences, usageDeviceIds: [...new Set(preferences.usageDeviceIds)] };
+    const requestedIds = [...new Set(preferences.usageDeviceIds)].filter((id) => id !== this.deviceId);
+    this.preferences = {
+      ...preferences,
+      usageDeviceIds: requestedIds.includes(NO_SYNC_USAGE_DEVICE) ? [NO_SYNC_USAGE_DEVICE] : requestedIds,
+    };
     await setSyncPreferences(this.preferences);
-    await setCursor("1970-01-01T00:00:00Z");
+    await setCursor({ updatedAt: "1970-01-01T00:00:00Z", id: "" });
     // Rebuild from the server so devices just excluded cannot remain in the
     // local aggregate from an earlier selection.
     await setRemoteUsage({});
@@ -338,7 +396,7 @@ export class SyncEngine {
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "sync_records", filter: `user_id=eq.${this.userId}` },
-        () => void this.pullSinceCursor(),
+        () => void this.pullSinceCursor().catch(() => undefined),
       )
       .subscribe();
   }
@@ -346,102 +404,124 @@ export class SyncEngine {
   // Pull -----------------------------------------------------------------
 
   async pullSinceCursor(): Promise<void> {
-    if (!this.dek || !this.userId) return;
+    const run = this.pullQueue.catch(() => undefined).then(() => this.pullSinceCursorLocked());
+    this.pullQueue = run;
     try {
-      const cursor = (await getCursor()) ?? "1970-01-01T00:00:00Z";
-      const { data, error } = await this.sb
+      await run;
+    } catch (err) {
+      this.recordError(err);
+      throw err;
+    }
+  }
+
+  private async pullSinceCursorLocked(): Promise<void> {
+    if (!this.dek || !this.userId) return;
+    const cursor = await getCursor();
+    let after: SyncCursor | null = null;
+    let maxCursor = cursor;
+    let foundRows = false;
+    let configRow: SyncRow | null = null;
+    let focusRow: SyncRow | null = null;
+    const focusGroupRows: SyncRow[] = [];
+    const remoteUsage = await getRemoteUsage();
+    let usageChanged = false;
+
+    for (;;) {
+      let query = this.sb
         .from("sync_records")
-        .select("namespace, record_key, device_id, ciphertext, version, deleted, updated_at")
+        .select("id, namespace, record_key, device_id, ciphertext, version, deleted, updated_at")
         .eq("user_id", this.userId)
-        .gt("updated_at", cursor)
-        .order("updated_at", { ascending: true });
+        .order("updated_at", { ascending: true })
+        .order("id", { ascending: true })
+        .limit(500);
+      if (after) {
+        query = query.or(
+          `updated_at.gt.${after.updatedAt},and(updated_at.eq.${after.updatedAt},id.gt.${after.id})`,
+        );
+      } else {
+        // Always replay the cursor timestamp. A new row can receive the exact
+        // same server timestamp with an id that sorts before our last id; tuple
+        // filtering alone would otherwise lose it forever. Record replacement
+        // and canonical echo suppression make this boundary replay idempotent.
+        query = query.gte("updated_at", cursor.updatedAt);
+      }
+      const { data, error } = await query;
       if (error) throw error;
       const rows = (data ?? []) as SyncRow[];
-      if (rows.length === 0) {
-        this.lastSync = Date.now();
-        return;
-      }
+      if (rows.length === 0) break;
+      foundRows = true;
 
-      let configRow: SyncRow | null = null;
-      let focusRow: SyncRow | null = null;
-      const focusGroupRows: SyncRow[] = [];
-      const remoteUsage = await getRemoteUsage();
-      let usageChanged = false;
-
-      // Hold the high water mark and only commit it once the whole batch has been
-      // applied. One undecryptable row is skipped instead of aborting the batch,
-      // but the cursor never moves past work that has not finished, so a failure
-      // mid pull just retries on the next tick rather than dropping records.
-      let maxCursor = cursor;
       for (const row of rows) {
-        try {
-          if (this.preferences.reducerConfigs && row.namespace === NS_EXT_CONFIG && row.device_id !== this.deviceId) {
-            configRow = row; // keep only the latest, rows arrive in updated_at order
-          } else if (this.preferences.reducerConfigs && row.namespace === NS_FOCUS && row.device_id !== this.deviceId) {
-            focusRow = row;
-          } else if (this.preferences.reducerConfigs && row.namespace === NS_FOCUS_GROUPS && row.device_id !== this.deviceId) {
-            focusGroupRows.push(row);
-          } else if (this.preferences.usageStats && row.namespace === NS_USAGE_WEB && row.device_id !== this.deviceId &&
-            (this.preferences.usageDeviceIds.length === 0 || (row.device_id && this.preferences.usageDeviceIds.includes(row.device_id)))) {
-            if (await this.applyUsageRow(row, remoteUsage)) usageChanged = true;
-          }
-        } catch {
-          // Skip a single bad row; the rest of the batch still applies.
+        this.validateRow(row);
+        if (this.preferences.reducerConfigs && !row.deleted && row.namespace === NS_EXT_CONFIG && row.device_id !== this.deviceId) {
+          configRow = row;
+        } else if (this.preferences.reducerConfigs && !row.deleted && row.namespace === NS_FOCUS && row.device_id !== this.deviceId) {
+          focusRow = row;
+        } else if (this.preferences.reducerConfigs && row.namespace === NS_FOCUS_GROUPS && row.device_id !== this.deviceId) {
+          if (focusGroupRows.length >= 5000) throw new Error("sync data is too large");
+          focusGroupRows.push(row);
+        } else if (this.preferences.usageStats && row.namespace === NS_USAGE_WEB && this.selectedRemoteDevice(row.device_id)) {
+          if (await this.applyUsageRow(row, remoteUsage)) usageChanged = true;
         }
-        if (row.updated_at > maxCursor) maxCursor = row.updated_at;
+        maxCursor = { updatedAt: row.updated_at, id: row.id };
       }
+      const last = rows[rows.length - 1]!;
+      after = { updatedAt: last.updated_at, id: last.id };
+      if (rows.length < 500) break;
+    }
 
-      if (focusGroupRows.length > 0) {
-        try {
-          await this.applyFocusGroupRows(focusGroupRows);
-        } catch {
-          /* leave focus groups for a later pull */
-        }
-      }
-      if (configRow) {
-        try {
-          await this.applyConfigRow(configRow);
-        } catch {
-          /* leave config for a later pull */
-        }
-      }
-      if (focusRow) {
-        try {
-          await this.applyFocusRow(focusRow);
-        } catch {
-          /* leave focus for a later pull */
-        }
-      }
-      if (usageChanged) {
-        this.pruneOldUsage(remoteUsage);
-        await setRemoteUsage(remoteUsage);
-        await this.publishRemoteUsage(remoteUsage);
-      }
-      await setCursor(maxCursor);
+    if (!foundRows) {
       this.lastSync = Date.now();
       this.lastError = null;
-    } catch (err) {
-      this.lastError = String((err as Error).message ?? err);
+      return;
     }
+    if (focusGroupRows.length) await this.applyFocusGroupRows(focusGroupRows);
+    if (configRow) await this.applyConfigRow(configRow);
+    if (focusRow) await this.applyFocusRow(focusRow);
+    if (usageChanged) {
+      this.pruneOldUsage(remoteUsage);
+      await setRemoteUsage(remoteUsage);
+      await this.publishRemoteUsage(remoteUsage);
+    }
+    await setCursor(maxCursor);
+    this.lastSync = Date.now();
+    this.lastError = null;
+  }
+
+  private selectedRemoteDevice(deviceId: string | null): boolean {
+    if (!deviceId || deviceId === this.deviceId) return false;
+    const selected = this.preferences.usageDeviceIds;
+    if (selected.includes(NO_SYNC_USAGE_DEVICE)) return false;
+    return selected.length === 0 || selected.includes(deviceId);
+  }
+
+  private validateRow(row: SyncRow): void {
+    if (!row.id || !row.namespace || !row.record_key || !row.updated_at) throw new Error("invalid sync row");
+    if (row.record_key.length > 1100 || row.ciphertext.length > 3_000_000) throw new Error("sync data is too large");
   }
 
   // Config is per platform and deliberately excludes focus groups, which travel
   // cross platform through their own namespace. Stripping them here keeps the two
   // sync paths from fighting over the same data.
   private configJson(settings: Settings): string {
-    return JSON.stringify({ ...settings, focusGroups: [] });
+    return JSON.stringify({ ...normalizeSettings(settings), focusGroups: [] });
   }
 
   private async applyConfigRow(row: SyncRow): Promise<void> {
     if (!this.dek || !this.userId) return;
     const aad = recordAad(this.userId, NS_EXT_CONFIG, row.record_key);
     const json = await decryptRecord(this.dek, aad, fromBase64Url(row.ciphertext));
-    const remote = JSON.parse(json) as Settings;
+    if (json.length > 5_000_000) throw new Error("sync config is too large");
+    const remote = normalizeSettings(JSON.parse(json));
     const local = await get("settings");
-    if (this.configJson(local) === json) return;
-    this.lastConfigJson = json; // remember so our own re-save is not pushed back
+    const canonical = this.configJson(remote);
+    if (this.configJson(local) === canonical) {
+      this.lastConfigJson = canonical;
+      return;
+    }
     // Keep our own focus groups; the config payload no longer carries them.
     await setFromRemote("settings", { ...remote, focusGroups: local.focusGroups });
+    this.lastConfigJson = canonical;
   }
 
   // Focus groups (cross platform) ---------------------------------------
@@ -477,6 +557,7 @@ export class SyncEngine {
     const groups = settings.focusGroups ?? [];
     const present = new Set<string>();
     for (const g of groups) {
+      if (!g.id || g.id.length > 200) throw new Error("invalid focus group id");
       present.add(g.id);
       const json = canonicalFocusGroupJson(this.toFocusPayload(g));
       if (this.focusGroupShadow.get(g.id) === json) continue;
@@ -484,15 +565,18 @@ export class SyncEngine {
       const blob = await encryptRecord(this.dek, aad, json);
       await this.upsertRecord(NS_FOCUS_GROUPS, g.id, blob);
       this.focusGroupShadow.set(g.id, json);
+      this.knownFocusGroupIds.add(g.id);
     }
     // Tombstone groups we synced before but the user has since removed.
-    for (const id of [...this.focusGroupShadow.keys()]) {
+    for (const id of [...this.knownFocusGroupIds]) {
       if (present.has(id)) continue;
       const aad = recordAad(this.userId, NS_FOCUS_GROUPS, id);
       const blob = await encryptRecord(this.dek, aad, JSON.stringify({ id }));
       await this.upsertRecord(NS_FOCUS_GROUPS, id, blob, true);
       this.focusGroupShadow.delete(id);
+      this.knownFocusGroupIds.delete(id);
     }
+    await setKnownFocusGroupIds(this.knownFocusGroupIds);
   }
 
   private async applyFocusGroupRows(rows: SyncRow[]): Promise<void> {
@@ -504,21 +588,35 @@ export class SyncEngine {
         removed.add(row.record_key);
         upserts.delete(row.record_key);
         this.focusGroupShadow.delete(row.record_key);
+        this.knownFocusGroupIds.delete(row.record_key);
         continue;
       }
+      if (!row.record_key || row.record_key.length > 200) throw new Error("invalid focus group id");
       const aad = recordAad(this.userId, NS_FOCUS_GROUPS, row.record_key);
       const json = await decryptRecord(this.dek, aad, fromBase64Url(row.ciphertext));
-      const payload = this.fromFocusPayload(JSON.parse(json) as FocusGroupPayload);
+      if (json.length > 1_000_000) throw new Error("focus group is too large");
+      const raw = JSON.parse(json) as Partial<FocusGroupPayload>;
+      const payload = this.fromFocusPayload({
+        id: row.record_key,
+        name: typeof raw.name === "string" ? raw.name.slice(0, 100) : "Focus",
+        mode: raw.mode === "all-except" ? "all-except" : "only",
+        exitable: raw.exitable !== false,
+        autoTurnOnDnd: raw.autoTurnOnDnd === true,
+        domains: this.safeStringArray(raw.domains),
+        packages: this.safeStringArray(raw.packages),
+      });
       upserts.set(row.record_key, payload);
       removed.delete(row.record_key);
       // Store the canonical form so our own re-save is recognised and not pushed back.
       this.focusGroupShadow.set(row.record_key, canonicalFocusGroupJson(this.toFocusPayload(payload)));
+      this.knownFocusGroupIds.add(row.record_key);
     }
     const settings = await get("settings");
     const byId = new Map((settings.focusGroups ?? []).map((g) => [g.id, g] as const));
     for (const id of removed) byId.delete(id);
     for (const [id, g] of upserts) byId.set(id, g);
     await setFromRemote("settings", { ...settings, focusGroups: [...byId.values()] });
+    await setKnownFocusGroupIds(this.knownFocusGroupIds);
   }
 
   // Focus mode (cross platform) -----------------------------------------
@@ -534,7 +632,8 @@ export class SyncEngine {
       mode: active && session!.mode === "all-except" ? "all-except" : "only",
       exitable: active ? session!.exitable : true,
       domains: active ? [...session!.domains].sort() : [],
-      packages: [],
+      packages: active ? [...(session!.packages ?? [])].sort() : [],
+      origin: this.deviceId ?? "",
     });
   }
 
@@ -544,10 +643,10 @@ export class SyncEngine {
     const session = await get("focus");
     const json = this.focusJson(session);
     if (json === this.lastFocusJson) return;
-    this.lastFocusJson = json;
     const aad = recordAad(this.userId, NS_FOCUS, "active");
     const blob = await encryptRecord(this.dek, aad, json);
     await this.upsertRecord(NS_FOCUS, "active", blob);
+    this.lastFocusJson = json;
   }
 
   private async applyFocusRow(row: SyncRow): Promise<void> {
@@ -563,14 +662,17 @@ export class SyncEngine {
       mode: string;
       exitable: boolean;
       domains: string[];
+      packages?: string[];
     };
+    if (json.length > 1_000_000 || p.groupId?.length > 200) throw new Error("invalid focus data");
     let session: FocusSession | null = null;
     if (p.active && p.endsAt > Date.now()) {
       const mode: FocusMode = p.mode === "all-except" ? "all-except" : "only-these";
       session = {
         groupId: p.groupId,
-        name: p.name || "Focus",
-        domains: p.domains ?? [],
+        name: typeof p.name === "string" ? p.name.slice(0, 100) || "Focus" : "Focus",
+        domains: this.safeStringArray(p.domains),
+        packages: this.safeStringArray(p.packages),
         mode,
         startedAt: p.startedAt || Date.now(),
         endsAt: p.endsAt,
@@ -585,16 +687,46 @@ export class SyncEngine {
 
   private async applyUsageRow(row: SyncRow, into: UsageHistory): Promise<boolean> {
     if (!this.dek || !this.userId) return false;
+    const recordDate = row.record_key.slice(row.record_key.lastIndexOf(":") + 1);
+    if (row.deleted) {
+      const day = into[recordDate];
+      if (!day) return false;
+      const prefix = `${row.device_id}|`;
+      let changed = false;
+      for (const key of Object.keys(day)) {
+        if (key.startsWith(prefix)) {
+          delete day[key];
+          changed = true;
+        }
+      }
+      if (Object.keys(day).length === 0) delete into[recordDate];
+      return changed;
+    }
     const aad = recordAad(this.userId, NS_USAGE_WEB, row.record_key);
     const json = await decryptRecord(this.dek, aad, fromBase64Url(row.ciphertext));
+    if (json.length > 2_000_000) throw new Error("usage record is too large");
     const p = JSON.parse(json) as UsageWebPayload;
+    if (!row.device_id || row.record_key !== `${row.device_id}:${p.date}` || !this.isRetainedUsageDate(p.date)) {
+      throw new Error("invalid usage record");
+    }
     // One record carries a device's whole day. Replace that device's slots so
     // removing a domain on the source device is reflected, never accumulated.
     const day = (into[p.date] ??= {});
     const prefix = `${row.device_id}|`;
     for (const k of Object.keys(day)) if (k.startsWith(prefix)) delete day[k];
-    for (const [domain, du] of Object.entries(p.domains ?? {})) {
-      day[`${row.device_id}|${domain}`] = { ms: du.ms, paths: du.paths ?? {} };
+    const entries = Object.entries(p.domains ?? {});
+    if (entries.length > 10_000) throw new Error("usage record has too many domains");
+    for (const [domain, du] of entries) {
+      if (!domain || domain.length > 1000 || !Number.isFinite(du.ms)) throw new Error("invalid usage entry");
+      const paths: Record<string, number> = {};
+      const pathEntries = Object.entries(du.paths ?? {});
+      if (pathEntries.length > 20_000) throw new Error("usage record has too many paths");
+      for (const [path, ms] of pathEntries) {
+        if (path.length > 4000 || !Number.isFinite(ms)) throw new Error("invalid usage path");
+        const relativePath = path === domain ? "" : path.startsWith(domain) ? path.slice(domain.length) : path;
+        paths[relativePath] = (paths[relativePath] ?? 0) + Math.max(0, ms);
+      }
+      day[`${row.device_id}|${domain}`] = { ms: Math.max(0, du.ms), paths };
     }
     return true;
   }
@@ -602,8 +734,9 @@ export class SyncEngine {
   // Keep the cross device usage cache from growing without bound. Only recent
   // days are shown, so older ones are dropped.
   private pruneOldUsage(history: UsageHistory): void {
-    const cutoff = dateKey(new Date(Date.now() - 14 * 86_400_000));
-    for (const date of Object.keys(history)) if (date < cutoff) delete history[date];
+    const cutoff = this.localDateOffset(-28);
+    const futureCutoff = this.localDateOffset(28);
+    for (const date of Object.keys(history)) if (date < cutoff || date > futureCutoff) delete history[date];
   }
 
   // Collapse the per device remote slots into a domain keyed history and store
@@ -631,14 +764,14 @@ export class SyncEngine {
   private scheduleConfigPush(): void {
     if (this.configPushTimer) clearTimeout(this.configPushTimer);
     this.configPushTimer = setTimeout(() => {
-      void this.pushConfig();
-      void this.pushFocusGroups();
+      void this.pushConfig().catch((err) => this.recordError(err));
+      void this.pushFocusGroups().catch((err) => this.recordError(err));
     }, PUSH_DEBOUNCE_MS);
   }
 
   private scheduleUsagePush(): void {
     if (this.usagePushTimer) clearTimeout(this.usagePushTimer);
-    this.usagePushTimer = setTimeout(() => void this.pushUsage(), PUSH_DEBOUNCE_MS);
+    this.usagePushTimer = setTimeout(() => void this.pushUsage().catch((err) => this.recordError(err)), PUSH_DEBOUNCE_MS);
   }
 
   private async pushConfig(): Promise<void> {
@@ -647,31 +780,37 @@ export class SyncEngine {
     const settings = await get("settings");
     const json = this.configJson(settings);
     if (json === this.lastConfigJson) return; // nothing new, or this came from a pull
-    this.lastConfigJson = json;
     const aad = recordAad(this.userId, NS_EXT_CONFIG, "config");
     const blob = await encryptRecord(this.dek, aad, json);
     await this.upsertRecord(NS_EXT_CONFIG, "config", blob);
+    this.lastConfigJson = json;
   }
 
   private async pushUsage(): Promise<void> {
     if (!this.preferences.usageStats) return;
     if (!this.dek || !this.userId || !this.deviceId) return;
     const usage = await get("usage");
-    // Key by local day, the same boundary the tracker and blocker use, so we
-    // never push the wrong calendar day in the hours either side of UTC midnight.
-    const today = todayKey();
-    const day = usage[today];
-    if (!day) return;
-    const domains: UsageWebPayload["domains"] = {};
-    for (const [domain, du] of Object.entries(day)) domains[domain] = { ms: du.ms, paths: du.paths };
-    const payload: UsageWebPayload = { date: today, platform: PLATFORM, domains };
-    const json = JSON.stringify(payload);
-    if (json === this.lastUsageJson) return; // nothing changed since the last push
-    this.lastUsageJson = json;
-    const recordKey = `${this.deviceId}:${today}`;
-    const aad = recordAad(this.userId, NS_USAGE_WEB, recordKey);
-    const blob = await encryptRecord(this.dek, aad, json);
-    await this.upsertRecord(NS_USAGE_WEB, recordKey, blob);
+    const retainedDates = Object.keys(usage).filter((date) => this.isRetainedUsageDate(date)).sort();
+    for (const date of retainedDates) {
+      const domains: UsageWebPayload["domains"] = {};
+      for (const domain of Object.keys(usage[date] ?? {}).sort()) {
+        const du = usage[date]![domain]!;
+        // Match Android: short visits are local-only noise and path identifiers
+        // include the domain so either platform can consume the payload directly.
+        if (du.ms < 60_000) continue;
+        const paths: Record<string, number> = {};
+        for (const path of Object.keys(du.paths).sort()) paths[`${domain}${path}`] = Math.max(0, du.paths[path]!);
+        domains[domain] = { ms: Math.max(0, du.ms), paths };
+      }
+      const payload: UsageWebPayload = { date, platform: PLATFORM, domains };
+      const json = JSON.stringify(payload);
+      if (this.usageShadows.get(date) === json) continue;
+      const recordKey = `${this.deviceId}:${date}`;
+      const aad = recordAad(this.userId, NS_USAGE_WEB, recordKey);
+      const blob = await encryptRecord(this.dek, aad, json);
+      await this.upsertRecord(NS_USAGE_WEB, recordKey, blob);
+      this.usageShadows.set(date, json);
+    }
   }
 
   private async upsertRecord(
@@ -680,7 +819,7 @@ export class SyncEngine {
     blob: Uint8Array,
     deleted = false,
   ): Promise<void> {
-    if (!this.userId || !this.deviceId) return;
+    if (!this.userId || !this.deviceId) throw new Error("sign in first");
     const { error } = await this.sb.from("sync_records").upsert(
       {
         user_id: this.userId,
@@ -693,7 +832,58 @@ export class SyncEngine {
       },
       { onConflict: "user_id,namespace,record_key" },
     );
-    if (error) this.lastError = error.message;
+    if (error) {
+      this.lastError = error.message;
+      throw error;
+    }
+    this.lastError = null;
+  }
+
+  async syncNow(): Promise<void> {
+    if (!this.dek) throw new Error("unlock sync first");
+    await this.registerDevice();
+    await this.refreshDevices();
+    await this.pullSinceCursor();
+    if (this.preferences.reducerConfigs) {
+      await this.pushConfig();
+      await this.pushFocusGroups();
+      await this.pushFocus();
+    }
+    if (this.preferences.usageStats) await this.pushUsage();
+    await this.pullSinceCursor();
+  }
+
+  private isRetainedUsageDate(date: string): boolean {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return false;
+    const parsed = new Date(`${date}T00:00:00`);
+    if (Number.isNaN(parsed.getTime()) || dateKey(parsed) !== date) return false;
+    const cutoff = this.localDateOffset(-28);
+    const futureCutoff = this.localDateOffset(28);
+    return date >= cutoff && date <= futureCutoff;
+  }
+
+  private localDateOffset(days: number): string {
+    const value = new Date();
+    value.setHours(12, 0, 0, 0);
+    value.setDate(value.getDate() + days);
+    return dateKey(value);
+  }
+
+  private safeStringArray(value: unknown): string[] {
+    if (!Array.isArray(value) || value.length > 5000) {
+      if (value == null) return [];
+      throw new Error("invalid sync list");
+    }
+    const result: string[] = [];
+    for (const item of value) {
+      if (typeof item !== "string" || item.length > 1000) throw new Error("invalid sync list item");
+      result.push(item);
+    }
+    return result;
+  }
+
+  private recordError(err: unknown): void {
+    this.lastError = String((err as Error)?.message ?? err);
   }
 
   // Status ---------------------------------------------------------------

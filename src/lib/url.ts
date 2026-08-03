@@ -5,11 +5,6 @@ export interface SiteLocation {
 
 const SKIP_PROTOCOLS = ["chrome:", "chrome-extension:", "about:", "moz-extension:", "edge:", "file:", "view-source:"];
 
-// Query params that identify distinct content, so usage lands on the video
-// being watched instead of one flat "/watch" bucket (mirroring the Android
-// tracker's per video granularity).
-const CONTENT_PARAMS: Array<[site: string, param: string]> = [["youtube.com", "v"]];
-
 export function parseLocation(rawUrl: string): SiteLocation | null {
   try {
     const url = new URL(rawUrl);
@@ -18,19 +13,11 @@ export function parseLocation(rawUrl: string): SiteLocation | null {
     // and must not split its stats into a second domain.
     const domain = url.hostname.replace(/^www\./, "").replace(/\.$/, "");
     if (!domain) return null;
-    return { domain, path: `${url.pathname || "/"}${contentQuery(domain, url)}` };
+    const pathname = url.pathname === "/" ? "" : url.pathname;
+    return { domain, path: `${pathname}${url.search}${url.hash}` };
   } catch {
     return null;
   }
-}
-
-function contentQuery(domain: string, url: URL): string {
-  for (const [site, param] of CONTENT_PARAMS) {
-    if (!domainMatches(domain, site)) continue;
-    const value = url.searchParams.get(param);
-    if (value) return `?${param}=${value}`;
-  }
-  return "";
 }
 
 export function domainMatches(target: string, rule: string): boolean {

@@ -77,6 +77,11 @@ export async function deriveKEKBytes(
   salt: Uint8Array,
   params: KdfParams = DEFAULT_KDF_PARAMS,
 ): Promise<Uint8Array> {
+  if (params.alg !== "PBKDF2-HMAC-SHA256" || params.hash !== "SHA-256") throw new Error("unsupported key derivation");
+  if (!Number.isInteger(params.iterations) || params.iterations < 1 || params.iterations > 2_000_000)
+    throw new Error("invalid key derivation work factor");
+  if (params.dkLenBits !== 256) throw new Error("invalid key length");
+  if (salt.length < 8 || salt.length > 64) throw new Error("invalid salt length");
   const base = await crypto.subtle.importKey("raw", enc.encode(passphrase), "PBKDF2", false, [
     "deriveBits",
   ]);
@@ -89,6 +94,7 @@ export async function deriveKEKBytes(
 }
 
 async function importAesKey(raw: Uint8Array): Promise<CryptoKey> {
+  if (![16, 24, 32].includes(raw.length)) throw new Error("invalid encryption key length");
   return crypto.subtle.importKey("raw", raw as BufferSource, "AES-GCM", false, ["encrypt", "decrypt"]);
 }
 
@@ -114,6 +120,7 @@ async function seal(
   plaintext: Uint8Array,
   nonce: Uint8Array = randomBytes(NONCE_LEN),
 ): Promise<Uint8Array> {
+  if (nonce.length !== NONCE_LEN) throw new Error("invalid nonce length");
   const ct = await crypto.subtle.encrypt(
     { name: "AES-GCM", iv: nonce as BufferSource, additionalData: enc.encode(aad), tagLength: TAG_BITS },
     key,
@@ -123,6 +130,7 @@ async function seal(
 }
 
 async function open(key: CryptoKey, aad: string, blob: Uint8Array): Promise<Uint8Array> {
+  if (blob.length < 1 + NONCE_LEN + TAG_BITS / 8) throw new Error("encrypted blob is too short");
   if (blob[0] !== FORMAT_VERSION) throw new Error(`unsupported blob version ${blob[0]}`);
   const nonce = blob.subarray(1, 1 + NONCE_LEN);
   const ctWithTag = blob.subarray(1 + NONCE_LEN);
@@ -188,8 +196,10 @@ export function buildPairingPayload(userId: string, dek: Uint8Array): string {
 }
 
 export function parsePairingPayload(raw: string): { userId: string; dek: Uint8Array } {
+  if (raw.length > 2048) throw new Error("pairing code is too large");
   const payload = JSON.parse(raw) as PairingPayload;
   if (payload.t !== "curbox-dek" || payload.v !== 1) throw new Error("not a curbox pairing code");
+  if (typeof payload.uid !== "string" || !payload.uid || payload.uid.length > 128) throw new Error("bad pairing account");
   const dek = fromBase64Url(payload.dek);
   if (dek.length !== 32) throw new Error("bad pairing key length");
   return { userId: payload.uid, dek };

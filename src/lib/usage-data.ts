@@ -6,10 +6,17 @@ export const RETENTION_DAYS = 28;
 
 export const MAX_PATHS_PER_DOMAIN = 200;
 
-export function addUsage(day: DayUsage, domain: string, path: string, ms: number): void {
+export function addUsage(day: DayUsage, domain: string, path: string, ms: number, hour?: number): void {
   const entry = (day[domain] ??= { ms: 0, paths: {} });
   entry.ms += ms;
   entry.paths[path] = (entry.paths[path] ?? 0) + ms;
+  if (hour != null && hour >= 0 && hour < 24) {
+    const hours = (entry.hours ??= {});
+    hours[hour] = (hours[hour] ?? 0) + ms;
+    const pathHours = (entry.pathHours ??= {});
+    const buckets = (pathHours[path] ??= {});
+    buckets[hour] = (buckets[hour] ?? 0) + ms;
+  }
 }
 
 export function sliceSpanByDay(from: number, to: number): Array<{ key: DateKey; ms: number }> {
@@ -21,6 +28,27 @@ export function sliceSpanByDay(from: number, to: number): Array<{ key: DateKey; 
     // never hang the worker: credit the rest to the current day and stop.
     const end = boundary > start ? Math.min(to, boundary) : to;
     slices.push({ key: dateKey(new Date(start)), ms: end - start });
+    start = end;
+  }
+  return slices;
+}
+
+export function sliceSpanByHour(from: number, to: number): Array<{ key: DateKey; hour: number; ms: number }> {
+  const slices: Array<{ key: DateKey; hour: number; ms: number }> = [];
+  let start = from;
+  while (start < to) {
+    const current = new Date(start);
+    const boundary = new Date(
+      current.getFullYear(),
+      current.getMonth(),
+      current.getDate(),
+      current.getHours() + 1,
+      0,
+      0,
+      0,
+    ).getTime();
+    const end = boundary > start ? Math.min(to, boundary) : to;
+    slices.push({ key: dateKey(current), hour: current.getHours(), ms: end - start });
     start = end;
   }
   return slices;
@@ -45,7 +73,14 @@ export function mergeUsage(
       for (const [path, ms] of Object.entries(buf.paths)) {
         paths[path] = (paths[path] ?? 0) + ms;
       }
-      const merged = { ms: (entry?.ms ?? 0) + buf.ms, paths };
+      const hours = addBuckets(entry?.hours, buf.hours);
+      const pathHours = { ...entry?.pathHours };
+      for (const [path, buckets] of Object.entries(buf.pathHours ?? {})) {
+        pathHours[path] = addBuckets(pathHours[path], buckets) ?? {};
+      }
+      const merged: DomainUsage = { ms: (entry?.ms ?? 0) + buf.ms, paths };
+      if (hours) merged.hours = hours;
+      if (Object.keys(pathHours).length > 0) merged.pathHours = pathHours;
       capPaths(merged);
       target[domain] = merged;
     }
@@ -57,11 +92,31 @@ export function mergeUsage(
 function capPaths(entry: DomainUsage): void {
   const keys = Object.keys(entry.paths);
   if (keys.length <= MAX_PATHS_PER_DOMAIN) return;
-  keys.sort((a, b) => entry.paths[b] - entry.paths[a]);
-  let folded = 0;
-  for (const key of keys.slice(MAX_PATHS_PER_DOMAIN - 1)) {
+  const overflow = keys
+    .filter((key) => key !== "/")
+    .sort((a, b) => entry.paths[b] - entry.paths[a])
+    .slice(MAX_PATHS_PER_DOMAIN - 1);
+  let folded = entry.paths["/"] ?? 0;
+  let foldedBuckets = entry.pathHours?.["/"];
+  for (const key of overflow) {
     folded += entry.paths[key];
+    const buckets = entry.pathHours?.[key];
+    if (buckets) {
+      foldedBuckets = addBuckets(foldedBuckets, buckets);
+      delete entry.pathHours![key];
+    }
     delete entry.paths[key];
   }
-  entry.paths["/"] = (entry.paths["/"] ?? 0) + folded;
+  entry.paths["/"] = folded;
+  if (foldedBuckets && entry.pathHours) entry.pathHours["/"] = foldedBuckets;
+}
+
+function addBuckets(a?: Record<number, number>, b?: Record<number, number>): Record<number, number> | undefined {
+  if (!a && !b) return undefined;
+  const result: Record<number, number> = {};
+  for (let hour = 0; hour < 24; hour++) {
+    const total = (a?.[hour] ?? 0) + (b?.[hour] ?? 0);
+    if (total > 0) result[hour] = total;
+  }
+  return result;
 }

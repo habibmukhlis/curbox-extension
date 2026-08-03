@@ -1,6 +1,6 @@
 import { browser } from "#imports";
 import { update } from "../lib/storage";
-import { addUsage, mergeUsage, sliceSpanByDay } from "../lib/usage-data";
+import { addUsage, mergeUsage, sliceSpanByHour } from "../lib/usage-data";
 import type { DateKey, DayUsage } from "../lib/types";
 import type { SiteLocation } from "../lib/url";
 
@@ -81,10 +81,10 @@ export function createUsageTracker(
     return machineState === "active";
   }
 
-  function bank(key: DateKey, domain: string, path: string, ms: number): void {
+  function bank(key: DateKey, domain: string, path: string, ms: number, hour?: number): void {
     let day = pending.get(key);
     if (!day) pending.set(key, (day = {}));
-    addUsage(day, domain, path, ms);
+    addUsage(day, domain, path, ms, hour);
   }
 
   // Fold the time elapsed since the counting window opened into the buffer.
@@ -100,8 +100,8 @@ export function createUsageTracker(
     // <= 0 means the system clock moved backwards; beyond the gap means the
     // process was frozen and the span is not real usage.
     if (ms <= 0 || ms > SUSPEND_GAP_MS) return;
-    for (const slice of sliceSpanByDay(from, now)) {
-      bank(slice.key, active.domain, active.path, slice.ms);
+    for (const slice of sliceSpanByHour(from, now)) {
+      bank(slice.key, active.domain, active.path, slice.ms, slice.hour);
     }
   }
 
@@ -187,7 +187,17 @@ export function createUsageTracker(
       // Put the batch back; the next tick retries.
       for (const [key, day] of drained) {
         for (const [domain, buf] of Object.entries(day)) {
-          for (const [path, ms] of Object.entries(buf.paths)) bank(key, domain, path, ms);
+          for (const [path, ms] of Object.entries(buf.paths)) {
+            const buckets = buf.pathHours?.[path];
+            if (buckets) {
+              Object.entries(buckets).forEach(([hourText, bucketMs]) => {
+                const hour = Number(hourText);
+                if (bucketMs > 0) bank(key, domain, path, bucketMs, hour);
+              });
+            } else {
+              bank(key, domain, path, ms);
+            }
+          }
         }
       }
       snapshot();
