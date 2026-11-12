@@ -1,6 +1,18 @@
 import type { BlockDecision, WarningScreen } from "../lib/types";
 import { AdaptiveMathChallenge } from "../core/adaptive-math";
 import { lockScroll } from "./dom";
+import { countdownClock } from "../lib/time";
+
+const SIP_STRETCH_TIPS = [
+  "Drink a full glass of water.",
+  "Stand up and reach for the sky.",
+  "Roll your shoulders back five times.",
+  "Look out a window at something far away.",
+  "Take a short walk around the room.",
+  "Breathe in slowly, then let it all out.",
+  "Turn your head gently from side to side.",
+  "Shake out your hands and wrists.",
+];
 
 const STYLE = `
 :host { all: initial; }
@@ -78,6 +90,7 @@ button {
 .error { color: #ffb4ab; opacity: 1; }
 .minutes { display: flex; align-items: center; justify-content: center; gap: 10px; font-size: 15px; }
 .minutes input { width: 96px; text-align: center; }
+.clock { font-size: 64px; font-weight: 300; line-height: 1; margin: 0; font-variant-numeric: tabular-nums; }
 
 `;
 
@@ -112,6 +125,7 @@ export interface OverlayHandlers {
   onProceed: (minutes?: number) => void;
   onLeave: () => void;
   onEndFocus: () => void;
+  onStruggling: () => void;
 }
 
 export interface Overlay {
@@ -198,6 +212,10 @@ export function createOverlay(): Overlay {
       renderFocus(body, decision, handlers);
       return;
     }
+    if (decision.source === "break") {
+      renderBreak(body, decision, handlers);
+      return;
+    }
     renderWarning(body, decision, handlers);
   }
 
@@ -214,12 +232,44 @@ export function createOverlay(): Overlay {
     }
   }
 
+  // Follows Android SipStretchBreakActivity: a countdown, one tip, and a way out.
+  function renderBreak(body: HTMLDivElement, decision: BlockDecision, handlers: OverlayHandlers): void {
+    const clock = document.createElement("p");
+    clock.className = "clock";
+    const tip = document.createElement("p");
+    tip.className = "sentence";
+    tip.textContent = SIP_STRETCH_TIPS[Math.floor(Math.random() * SIP_STRETCH_TIPS.length)];
+    body.append(
+      clock,
+      tip,
+      makeNote("Your sites will open again when the timer ends."),
+      makeButton("Leave this page", handlers.onLeave),
+    );
+    const tick = () => {
+      const left = decision.breakEndsAt - Date.now();
+      if (left <= 0) return hide();
+      clock.textContent = countdownClock(left);
+    };
+    tick();
+    timers.add(setInterval(tick, 1000));
+  }
+
   // Follows Android WarningActivity: opens left, a wait before the challenge,
   // then Proceed and Cancel. When there is no way through, only Okay remains.
   function renderWarning(body: HTMLDivElement, decision: BlockDecision, handlers: OverlayHandlers): void {
     const warning = decision.warning;
     const actions = document.createElement("div");
     actions.className = "actions";
+
+    const appendUrgeSurf = () => {
+      if (decision.urgeSurf === "none") return;
+      if (decision.urgeSurf === "offer") {
+        actions.appendChild(
+          makeNote("You unlocked blocked sites a few times in a row. That can mean a strong craving. Want help riding it out?"),
+        );
+      }
+      actions.appendChild(makeButton("I'm struggling", handlers.onStruggling, "secondary"));
+    };
 
     if (!decision.canProceed || !warning) {
       if (decision.focusGoalRemainingMs > 0) {
@@ -233,6 +283,7 @@ export function createOverlay(): Overlay {
         );
       }
       actions.appendChild(makeButton("Okay", handlers.onLeave));
+      appendUrgeSurf();
       body.appendChild(actions);
       return;
     }
@@ -245,6 +296,7 @@ export function createOverlay(): Overlay {
     const proceedButton = makeButton("Proceed", () => {});
     proceedButton.disabled = true;
     actions.append(proceedButton, makeButton("Cancel", handlers.onLeave, "secondary"));
+    appendUrgeSurf();
     body.append(slot, actions);
 
     const proceed = (minutes?: number) => {

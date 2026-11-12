@@ -1,5 +1,5 @@
 import { browser } from "#imports";
-import type { DateKey, DayUsage, FocusLogEntry, FocusSession, ProceedRecord, Settings, SiteOpens, UsageHistory } from "./types";
+import type { CravingSession, DateKey, DayUsage, FocusLogEntry, FocusSession, ProceedRecord, Settings, SipStretchState, SiteOpens, UsageHistory } from "./types";
 import { normalizeSettings } from "./types";
 import type { StoredList } from "./word-lists";
 
@@ -12,6 +12,10 @@ interface StoreShape {
   termsAccepted: boolean;
   opens: SiteOpens;
   wordLists: Record<string, StoredList>; // local only, see word-lists.ts
+  sipStretch: SipStretchState;
+  /** Unlocks in a row without backing out. Strong cravings show up as long streaks. */
+  unlockStreak: number;
+  cravings: CravingSession[];
 }
 
 export const DEFAULT_SETTINGS: Settings = normalizeSettings({});
@@ -25,6 +29,9 @@ const DEFAULTS: { [K in keyof StoreShape]: () => StoreShape[K] } = {
   termsAccepted: () => false,
   opens: () => ({ last: "", days: {} }),
   wordLists: () => ({}),
+  sipStretch: () => ({ usedMs: 0, lastAt: 0, breakEndsAt: 0 }),
+  unlockStreak: () => 0,
+  cravings: () => [],
 };
 
 // Usage is stored one day per key, so the tracker's tick only rewrites today
@@ -158,25 +165,6 @@ export function update<K extends keyof StoreShape>(
     if (next !== current) await set(key, next);
     return next;
   });
-}
-
-// The sync engine applies remote changes through this so it can recognise its
-// own writes and avoid pushing them straight back up (echo suppression).
-let applyingRemote = 0;
-
-export async function setFromRemote<K extends keyof StoreShape>(key: K, value: StoreShape[K]): Promise<void> {
-  applyingRemote++;
-  try {
-    await set(key, value);
-  } finally {
-    queueMicrotask(() => {
-      applyingRemote = Math.max(0, applyingRemote - 1);
-    });
-  }
-}
-
-export function isApplyingRemote(): boolean {
-  return applyingRemote > 0;
 }
 
 // Older releases could store settings that predate the current shape. Write

@@ -1,13 +1,14 @@
 import { defineBackground, browser } from "#imports";
 import { enableStorageCache, get, getUsage, migrateSettings, watch } from "../lib/storage";
 import { parseLocation, type SiteLocation } from "../lib/url";
-import type { BlockDecision, FocusSession, Settings } from "../lib/types";
+import type { BlockDecision, FocusSession, Settings, SipStretchState } from "../lib/types";
 import type { ContentMessage, PromptReply } from "../lib/messages";
 import { sendToTab } from "../lib/messages";
 import { evaluate, PASS } from "../core/blocker";
 import { activeSession, endSession } from "../core/focus";
-import { clearExitedOnOpenGrants, pruneGrants, recordProceed } from "../core/grants";
+import { clearExitedOnOpenGrants, pruneGrants, recordProceed, resetUnlockStreak } from "../core/grants";
 import { noteOpen } from "../core/opens";
+import { endBreakIfDue, noteSpan, resetSipStretch } from "../core/sip-stretch";
 import { compiledLists, reconcileLists } from "../core/lists";
 import { groupMatches } from "../lib/match";
 import { promptValues } from "../lib/prompt";
@@ -22,97 +23,29 @@ import {
   setMachineState,
   setTabAudible,
   liveDeltas,
+  onSpan,
 } from "../core/usage";
-import { getSyncEngine } from "../lib/sync/engine";
-import { isSyncRequest, type SyncRequest, type SyncResponse } from "../lib/sync/types";
+import { getLanSync, isLanRequest, type LanRequest, type LanResponse } from "../lib/lan/engine";
 
 let focusedTabId: number | null = null;
 
-const sync = getSyncEngine();
+const lan = getLanSync();
 
-async function handleSync(req: SyncRequest): Promise<SyncResponse> {
+async function handleLan(req: LanRequest): Promise<LanResponse> {
   try {
-    switch (req.type) {
-      case "sync:signUp":
-        await sync.signUp(req.email, req.password);
-        break;
-      case "sync:signIn":
-        await sync.signIn(req.email, req.password);
-        break;
-      case "sync:verifyCode":
-        await sync.verifyCode(req.email, req.code);
-        break;
-      case "sync:resendCode":
-        await sync.resendCode(req.email);
-        break;
-      case "sync:sendReset":
-        await sync.sendReset(req.email);
-        break;
-      case "sync:resetPassword":
-        await sync.resetPassword(req.email, req.code, req.password);
-        break;
-      case "sync:signOut":
-        await sync.signOut();
-        break;
-      case "sync:setPassphrase":
-        await sync.setPassphrase(req.passphrase);
-        break;
-      case "sync:unlock":
-        await sync.unlock(req.passphrase);
-        break;
-      case "sync:makePairingCode":
-        return { ok: true, pairingCode: await sync.makePairingCode(), status: await sync.status() };
-      case "sync:pairWithCode":
-        await sync.pairWithCode(req.payload);
-        break;
-      case "sync:setDeviceName":
-        await sync.setDeviceName(req.name);
-        break;
-      case "sync:syncNow":
-        await sync.syncNow();
-        break;
-      case "sync:subscribe": {
-        const url = await sync.billingUrl("checkout");
-        await browser.tabs.create({ url });
-        break;
-      }
-      case "sync:manageSubscription": {
-        const url = await sync.billingUrl("manage");
-        await browser.tabs.create({ url });
-        break;
-      }
-      case "sync:refreshEntitlement":
-        await sync.refreshEntitlement();
-        break;
-      case "sync:setPreferences":
-        await sync.setPreferences(req.preferences);
-        break;
-      case "sync:status":
-        break;
+    if (req.type === "lan:pairCode") await lan.pairCode(req.code, req.hint);
+    else if (req.type === "lan:hint") {
+      await lan.setHint(req.hint);
+      void lan.syncNow().catch(() => undefined);
     }
-    return { ok: true, status: await sync.status() };
+    else if (req.type === "lan:unpair") await lan.unpair();
+    else if (req.type === "lan:syncNow") await lan.syncNow();
+    else if (req.type === "lan:search") await lan.searchNow();
+    else if (req.type === "lan:forgetPlace") await lan.forgetPlace(req.id);
+    return { ok: true, status: await lan.status() };
   } catch (err) {
-    return { ok: false, error: friendlyError(err), status: await sync.status() };
+    return { ok: false, error: String((err as Error)?.message ?? err), status: await lan.status() };
   }
-}
-
-function friendlyError(err: unknown): string {
-  const raw = String((err as Error)?.message ?? err ?? "");
-  const m = raw.toLowerCase();
-  if (m.includes("invalid login") || (m.includes("invalid") && m.includes("credential")))
-    return "That email or password did not match. Please try again.";
-  if (m.includes("already registered") || m.includes("already been registered"))
-    return "You already have an account with this email. Please sign in instead.";
-  if (m.includes("email not confirmed")) return "Please confirm your email first. I can send you a new code.";
-  if (m.includes("token has expired") || m.includes("otp") || (m.includes("invalid") && m.includes("code")))
-    return "That code did not work. Check it or ask me for a new one.";
-  if (m.includes("for security purposes") || m.includes("rate limit") || m.includes("too many"))
-    return "Please wait a moment, then try again.";
-  if (m.includes("password should be") || (m.includes("at least") && m.includes("character")))
-    return "Please use a password with at least 6 letters or numbers.";
-  if (m.includes("failed to fetch") || m.includes("network") || m.includes("timeout") || m.includes("offline"))
-    return "I cannot reach the internet right now. Check your connection and try again.";
-  return raw || "Something went wrong. Please try again.";
 }
 
 // A schedule can start the evening before, so limits and prompts only ever
@@ -127,7 +60,7 @@ type DecideInput = Omit<Parameters<typeof evaluate>[0], "location" | "now">;
 
 // Everything a verdict depends on, loaded once and shared by every tab in a pass.
 async function loadDecideInput(): Promise<DecideInput> {
-  const [settings, usage, grants, proceeds, focus, focusLog, lists] = await Promise.all([
+  const [settings, usage, grants, proceeds, focus, focusLog, lists, sipStretch, unlockStreak] = await Promise.all([
     get("settings"),
     getUsage(recentDays()),
     get("grants"),
@@ -135,8 +68,10 @@ async function loadDecideInput(): Promise<DecideInput> {
     activeSession(),
     get("focusLog"),
     compiledLists(),
+    get("sipStretch"),
+    get("unlockStreak"),
   ]);
-  return { settings, usage, grants, proceeds, focus, focusLog, lists };
+  return { settings, usage, grants, proceeds, focus, focusLog, lists, sipStretch, unlockStreak };
 }
 
 // Last verdict delivered to each tab, so repeated passes (ticks, settings
@@ -280,11 +215,26 @@ function scheduleGrantEnd(grants: Record<string, number>): void {
   if (upcoming.length > 0) browser.alarms.create("grant-end", { when: Math.min(...upcoming) });
 }
 
+// Every banked span rewrites the Sip & Stretch count, so only a new break end
+// reschedules the alarm and re-evaluates the tabs.
+let breakEndsAt: number | null = null;
+
+function onSipStretchState(state: SipStretchState): void {
+  if (state.breakEndsAt === breakEndsAt) return;
+  const first = breakEndsAt === null;
+  breakEndsAt = state.breakEndsAt;
+  void browser.alarms.clear("sip-stretch-end");
+  if (breakEndsAt > 0) browser.alarms.create("sip-stretch-end", { when: Math.max(Date.now() + 1000, breakEndsAt) });
+  if (!first) scheduleAllTabs();
+}
+
 // The OS tells us directly when the machine goes idle or the screen locks (lid
 // close, walking away, sleep). The tracker stops the clock on anything but
 // "active", unless the tab is audibly playing, which proves passive use.
 function applyIdleState(state: "active" | "idle" | "locked"): void {
   void setMachineState(state);
+  // Sync asks the phone only while someone is here, and catches up on return.
+  void lan.onMachineState(state).catch(() => undefined);
 }
 
 const PANEL_WIDTH = 480;
@@ -410,8 +360,7 @@ export default defineBackground(() => {
     void openAppWindow();
   });
 
-  // Call registerSyncProvider before this when a remote sync service is connected.
-  void sync.start().catch(() => undefined);
+  void lan.start().catch(() => undefined);
 
   // Smallest interval the API allows, so a closed lid stops counting promptly.
   // Missing on Firefox Android; skipping it must not abort the rest of startup.
@@ -430,9 +379,12 @@ export default defineBackground(() => {
           await evaluateFocused();
         })
         .catch(() => undefined);
-      void sync.pullSinceCursor().catch(() => undefined);
+      // Decides itself whether the phone is due; most ticks leave it asleep.
+      void lan.onTick().catch(() => undefined);
     } else if (alarm.name === "focus-end") {
       void activeSession().then(() => scheduleAllTabs(), () => undefined);
+    } else if (alarm.name === "sip-stretch-end") {
+      void endBreakIfDue().catch(() => undefined);
     } else if (alarm.name === "grant-end") {
       void pruneGrants().then(() => scheduleAllTabs(), () => undefined);
     }
@@ -441,6 +393,8 @@ export default defineBackground(() => {
   void activeSession().then(scheduleFocusEnd);
   void get("settings").then(reconcileLists);
   void get("grants").then(scheduleGrantEnd);
+  void get("sipStretch").then(onSipStretchState);
+  onSpan((location, from, to) => void noteSpan(location, from, to).catch(() => undefined));
 
   // On worker start, only begin tracking if the user has accepted the terms.
   // If not yet accepted, the watch handler below starts tracking once they do.
@@ -455,9 +409,17 @@ export default defineBackground(() => {
       syncWindowFocus();
       void evaluateFocused().catch(() => undefined);
     }
-    if ("focus" in changed) scheduleFocusEnd(changed.focus ?? null);
+    if ("focus" in changed) {
+      scheduleFocusEnd(changed.focus ?? null);
+      void lan.onLocalFocusChanged().catch(() => undefined);
+    }
     if ("grants" in changed) scheduleGrantEnd(changed.grants ?? {});
-    if ("settings" in changed && changed.settings) void reconcileLists(changed.settings).catch(() => undefined);
+    if ("sipStretch" in changed && changed.sipStretch) onSipStretchState(changed.sipStretch);
+    if ("settings" in changed && changed.settings) {
+      void reconcileLists(changed.settings).catch(() => undefined);
+      if (!changed.settings.sipStretch.enabled) void resetSipStretch().catch(() => undefined);
+      void lan.onLocalSettingsChanged(changed.settings.focusGroups ?? []).catch(() => undefined);
+    }
     if ("focus" in changed || "focusLog" in changed || "settings" in changed || "wordLists" in changed) {
       scheduleAllTabs(changed.settings);
     }
@@ -530,6 +492,19 @@ export default defineBackground(() => {
       void endSession();
       return;
     }
+    if (message.type === "leave") {
+      void resetUnlockStreak().catch(() => undefined);
+      return;
+    }
+    if (message.type === "urgeSurf") {
+      // Leave the blocked page so it is not waiting behind the exercise.
+      if (tabId != null) delivered.delete(tabId);
+      const url = browser.runtime.getURL(`/urge.html?site=${encodeURIComponent(message.domain)}`);
+      void resetUnlockStreak()
+        .then(() => (tabId != null ? browser.tabs.update(tabId, { url }) : browser.tabs.create({ url })))
+        .catch(() => undefined);
+      return;
+    }
     if (message.type === "prompt") {
       void gentlePrompt(message.url).then(sendResponse, () => sendResponse(undefined));
       return true;
@@ -545,8 +520,8 @@ export default defineBackground(() => {
   });
 
   browser.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) => {
-    if (!isSyncRequest(message)) return;
-    void handleSync(message).then(sendResponse);
+    if (!isLanRequest(message)) return;
+    void handleLan(message).then(sendResponse);
     return true;
   });
 });

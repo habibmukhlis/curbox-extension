@@ -1,7 +1,7 @@
 import { get, set, update } from "../lib/storage";
 import { dateKey } from "../lib/time";
-import type { FocusGroup, FocusSession } from "../lib/types";
-import { isOnBreak, newPomodoro, nextPhase, phaseMs } from "./pomodoro";
+import type { FocusGroup, FocusSession, PomodoroState } from "../lib/types";
+import { isOnBreak, newPomodoro, nextPhase, normalizePomodoro, phaseMs } from "./pomodoro";
 
 export interface PomodoroChoice {
   breakMinutes: number;
@@ -31,6 +31,31 @@ export async function startSession(
     exitable,
     plannedMs,
     ...(pomodoro && { pomodoro }),
+  };
+  await set("focus", session);
+  return session;
+}
+
+// Joins a session another device started, ending when it ends there.
+// A pomodoro joins the other device's cycle at its current phase.
+export async function startSessionUntil(
+  group: FocusGroup,
+  endsAt: number,
+  exitable: boolean,
+  pomodoro?: PomodoroState,
+): Promise<FocusSession> {
+  const now = Date.now();
+  const session: FocusSession = {
+    groupId: group.id,
+    name: group.name,
+    domains: group.domains,
+    packages: group.packages ?? [],
+    mode: group.mode,
+    startedAt: now,
+    endsAt,
+    exitable,
+    plannedMs: Math.max(0, endsAt - now),
+    ...(pomodoro && { pomodoro: normalizePomodoro(pomodoro) }),
   };
   await set("focus", session);
   return session;

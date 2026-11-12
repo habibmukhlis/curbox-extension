@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { evaluate } from "./blocker";
 import { dateKey } from "../lib/time";
-import { defaultGentlePrompt, newGroup, type FocusLogEntry, type FocusSession, type Settings, type UsageHistory } from "../lib/types";
+import { newGroup, normalizeSettings, type FocusLogEntry, type FocusSession, type Settings, type UsageHistory } from "../lib/types";
 
 const NOW = new Date(2026, 7, 3, 10, 30).getTime();
 
@@ -10,7 +10,7 @@ function settingsFor(limitMinutes: number, ranges = [{ start: 9 * 60, end: 17 * 
   group.id = "video";
   group.matchers = ["youtube.com"];
   group.schedule.days = group.schedule.days.map(() => ({ active: true, limitMinutes, ranges }));
-  return { schemaVersion: 2, groups: [group], focusGroups: [], gentlePrompt: defaultGentlePrompt(), grayscaleGroups: [], hiddenElements: [], usageIgnoredSites: [], usageBackgroundArt: "" };
+  return { ...normalizeSettings({}), groups: [group] };
 }
 
 function decide(settings: Settings, usage: UsageHistory = {}, now = NOW, focus: FocusSession | null = null, focusLog: FocusLogEntry[] = []) {
@@ -159,5 +159,19 @@ describe("warning screen details", () => {
     settings.focusGroups = [{ id: "deep", name: "Deep work", domains: [], mode: "only-these", exitable: true }];
     settings.groups[0].warning = { ...settings.groups[0].warning, focusGoalEnabled: true, focusGoalGroupId: "deep", focusGoalRequiredMinutes: 30 };
     expect(decide(settings)).toMatchObject({ canProceed: false, focusGoalGroupName: "Deep work", focusGoalRemainingMs: 30 * 60_000 });
+  });
+});
+
+describe("urge surfing on block screens", () => {
+  const withStreak = (unlockStreak: number, buttonEnabled: boolean, autoOfferEnabled = true) => {
+    const settings = { ...settingsFor(0), urgeSurf: { buttonEnabled, autoOfferEnabled } };
+    return evaluate({ location: { domain: "youtube.com", path: "/watch" }, settings, focus: null, usage: {}, focusLog: [], now: NOW, grants: {}, proceeds: {}, unlockStreak }).urgeSurf;
+  };
+
+  it("shows the button when on and offers help after 3 unlocks in a row", () => {
+    expect(withStreak(0, true)).toBe("button");
+    expect(withStreak(2, false)).toBe("none");
+    expect(withStreak(3, false)).toBe("offer");
+    expect(withStreak(3, true, false)).toBe("button");
   });
 });
